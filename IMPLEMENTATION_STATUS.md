@@ -81,8 +81,7 @@ whole is not being marked complete.
 
 Status: **complete**
 
-Commit: `chore: establish systems foundation` (see repository log for SHA;
-committed on top of `08ff136`)
+Commit: `62ec505` — `chore: establish systems foundation`
 
 Files changed:
 
