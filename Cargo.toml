@@ -1,0 +1,14 @@
+[package]
+name = "terminal_janitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Cross-platform total/available disk-space query (statvfs on Unix,
+# GetDiskFreeSpaceExW on Windows) without shelling out to df/wmic/PowerShell.
+fs4 = "1"
+
+[dev-dependencies]
+# Isolated, auto-cleaned temp directories for filesystem-touching tests
+# (spaces/Unicode paths) without writing into the real project tree.
+tempfile = "3"
