@@ -10,13 +10,9 @@ fn command(isolated_config_home: &Path) -> Command {
     command.env("XDG_CONFIG_HOME", isolated_config_home);
     #[cfg(target_os = "macos")]
     command.env("HOME", isolated_config_home);
-    #[cfg(target_os = "windows")]
-    {
-        // ProjectDirs uses the Known Folder API on Windows. CI runs in a
-        // clean account; these variables also isolate fallback resolution.
-        command.env("APPDATA", isolated_config_home);
-        command.env("USERPROFILE", isolated_config_home);
-    }
+    // Windows deliberately receives no profile overrides: ProjectDirs uses
+    // the Known Folder API, and changing profile variables can make that API
+    // unavailable. GitHub CI supplies a clean account for the default test.
 
     command
 }
