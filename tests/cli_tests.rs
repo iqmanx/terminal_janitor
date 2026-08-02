@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 
 fn command(isolated_config_home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_terminal_janitor"));
+    command.current_dir(isolated_config_home);
 
     #[cfg(target_os = "linux")]
     command.env("XDG_CONFIG_HOME", isolated_config_home);
@@ -25,10 +26,20 @@ fn run(args: &[&str]) -> Output {
     command(home.path()).args(args).output().unwrap()
 }
 
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "command failed with {:?}; stdout={:?}; stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn help_lists_only_implemented_command() {
     let output = run(&["--help"]);
-    assert!(output.status.success());
+    assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("status"));
     for later_command in ["init", "scan", "check", "clean", "protect", "history"] {
@@ -39,7 +50,7 @@ fn help_lists_only_implemented_command() {
 #[test]
 fn version_reports_package_version() {
     let output = run(&["--version"]);
-    assert!(output.status.success());
+    assert_success(&output);
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         concat!("terminal_janitor ", env!("CARGO_PKG_VERSION"))
@@ -49,7 +60,7 @@ fn version_reports_package_version() {
 #[test]
 fn human_status_is_read_only_and_labels_configuration() {
     let output = run(&["status"]);
-    assert!(output.status.success());
+    assert_success(&output);
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     for label in [
@@ -69,7 +80,7 @@ fn human_status_is_read_only_and_labels_configuration() {
 #[test]
 fn json_status_is_valid_and_has_stable_schema() {
     let output = run(&["status", "--json"]);
-    assert!(output.status.success());
+    assert_success(&output);
     assert!(output.stderr.is_empty());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let fields: BTreeSet<_> = value
