@@ -348,8 +348,10 @@ Status: **complete**
 
 Date: 2026-08-02
 
-Commit: `feat: add state ledger and identity safety` (single focused commit;
-SHA is the commit carrying this section — verify with `git log --oneline -1`)
+Commits:
+
+- `7c0b3f0` — `feat: add state ledger and identity safety`
+- `190a7aa` — `fix: open directories for Windows identity queries`
 
 Files changed:
 
@@ -489,7 +491,19 @@ Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
   previous file byte-identical; a read-only directory (Unix) fails the
   temporary write with the previous file intact; successful replacement
   leaves no temporary files; parents are created 0o700 on Unix;
-  `format_size` round-trips through the strict parser including `u64::MAX`.
+  `format_size` round-trips through the strict parser including `u64::MAX`;
+- CI: the first run for `7c0b3f0`
+  ([`30753921516`](https://github.com/iqmanx/terminal_janitor/actions/runs/30753921516))
+  passed Ubuntu and macOS completely (format, strict Clippy, all tests —
+  including Windows-targeted Clippy passing on the real Windows toolchain)
+  but failed three Windows identity tests: `File::open` cannot open a
+  directory on Windows without `FILE_FLAG_BACKUP_SEMANTICS`, so
+  `file_identity` returned the explicit `VolumeIdentityUnavailable` error —
+  the fail-closed path, not a wrong identity. `190a7aa` opens directory
+  handles with a zero access mode plus `FILE_FLAG_BACKUP_SEMANTICS`;
+  [GitHub Actions run `30754968125`](https://github.com/iqmanx/terminal_janitor/actions/runs/30754968125)
+  then passed on Ubuntu, macOS, and Windows (74/74 tests on each OS-applicable
+  set, 0 ignored).
 
 Manual evidence:
 
@@ -505,10 +519,6 @@ Manual evidence:
 
 Known limitations:
 
-- CI has not run for this commit (no push was authorised this session);
-  macOS and Windows evidence for the new platform identity code and the
-  case/Windows-path test variants therefore comes from code review, not CI.
-  Run the three-OS matrix before treating the full Day 2 gate as satisfied.
 - Volume identity is best-available native metadata: `st_dev` can change
   across reboots for some filesystem types, and the Windows volume serial is
   32-bit. Day 4's pre-execution revalidation must re-resolve identity from
@@ -546,7 +556,7 @@ Exact next action: **Day 2B — Registration, Discovery & CLI Workflows**
 (`init`, approved-root registration writing config atomically, read-only
 pnpm workspace discovery beneath approved roots, protection commands, and
 `scan`), strictly on top of the Day 2A state API. Do not begin Day 3
-planning/proof behaviour, and run three-OS CI for this commit first.
+planning/proof behaviour.
 
 ### Days 2B–7
 
@@ -593,8 +603,8 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Verify the repository and branch state, and run three-OS CI for the Day 2A
-   commit if it has not run yet.
+2. Verify the repository and branch state (Day 2A CI is green on all three
+   operating systems as of run `30754968125`).
 3. Begin **Day 2B — Registration, Discovery & CLI Workflows**: `init`,
    approved-root registration (writing configuration through
    `config::save_config_at`), read-only pnpm workspace discovery beneath
