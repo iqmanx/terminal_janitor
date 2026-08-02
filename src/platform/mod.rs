@@ -41,6 +41,10 @@ pub fn capacity_for(path: &Path) -> Result<DiskCapacity, DiskError> {
     allow(dead_code)
 )]
 fn measure(path: &Path) -> Result<DiskCapacity, DiskError> {
+    // Windows GetDiskFreeSpaceExW may successfully resolve the volume for a
+    // nonexistent child path. Validate the requested measurement target first
+    // so every platform preserves DiskProvider's exact-path contract.
+    std::fs::metadata(path).map_err(|source| to_disk_error(path, source))?;
     let total = fs4::total_space(path).map_err(|source| to_disk_error(path, source))?;
     let available = fs4::available_space(path).map_err(|source| to_disk_error(path, source))?;
     DiskCapacity::new(total, available)
