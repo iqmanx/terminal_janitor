@@ -95,6 +95,7 @@ The file format is strict TOML:
 ```toml
 minimum_free = "10GiB"
 target_free = "15GiB"
+approved_roots = []
 ```
 
 Sizes must be unsigned whole numbers followed immediately by one of the
@@ -103,6 +104,13 @@ signs, whitespace, unknown units, overflow, zero `minimum_free`, and a
 `target_free` less than or equal to `minimum_free` are rejected. `GB` is not
 accepted or interpreted as `GiB`. An invalid existing file fails closed with
 `FAILED_CONFIGURATION`; it never falls back to defaults.
+
+`approved_roots` is optional and defaults to an empty list, so Day 1
+configuration files remain valid unchanged. When present it must contain
+absolute paths; entries are sorted and de-duplicated deterministically, and a
+relative entry fails closed. The Day 2B `init`/registration workflow will be
+the normal way to populate it. No current command performs any cleanup based
+on this list.
 
 ## Status JSON
 
@@ -138,6 +146,10 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 ## Current state
 
 Day 1's read-only systems, configuration, and status CLI implementation is
-complete. Ubuntu, macOS, and Windows CI pass. See
-[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact Day 2
+complete with Ubuntu, macOS, and Windows CI passing. Day 2A added the internal
+state foundation: a bundled-SQLite metadata ledger with explicit transactional
+migrations and fail-closed corruption handling, canonical volume-bound path
+identity, and atomic configuration writes. No new CLI commands, discovery,
+pnpm integration, or cleanup behaviour exist yet. See
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact Day 2B
 handover state.

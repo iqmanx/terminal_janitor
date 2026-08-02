@@ -8,15 +8,27 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 # Platform-native per-user application configuration directories.
 directories = "6"
+# Canonicalisation that strips Windows verbatim (\\?\) prefixes when safe so
+# stored path identities have one deterministic spelling per platform.
+dunce = "1"
 # Cross-platform total/available disk-space query (statvfs on Unix,
 # GetDiskFreeSpaceExW on Windows) without shelling out to df/wmic/PowerShell.
 fs4 = "1"
+# Bundled SQLite for the local metadata ledger; the user never needs a system
+# SQLite library or database server.
+rusqlite = { version = "0.37", features = ["bundled"] }
 # Stable machine-readable output and strict TOML configuration loading.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Same-directory temporary files for atomic configuration replacement, and
+# isolated auto-cleaned fixture directories in tests.
+tempfile = "3"
 toml = "0.9"
 
-[dev-dependencies]
-# Isolated, auto-cleaned temp directories for filesystem-touching tests
-# (spaces/Unicode paths) without writing into the real project tree.
-tempfile = "3"
+[target.'cfg(windows)'.dependencies]
+# GetFileInformationByHandle for native volume-serial/file-index identity;
+# already a transitive dependency of fs4 on Windows.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

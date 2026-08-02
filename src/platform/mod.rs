@@ -36,6 +36,49 @@ pub fn capacity_for(path: &Path) -> Result<DiskCapacity, DiskError> {
     }
 }
 
+/// Best-available native identity for the volume containing `path` and for
+/// the file or directory itself, as `(volume, file)` opaque strings.
+///
+/// Uses only native filesystem metadata: `stat` device/inode numbers on Linux
+/// and macOS, and the volume serial number plus file index from
+/// `GetFileInformationByHandle` on Windows. No shell command, output parsing,
+/// or privilege escalation is involved. Unsupported platforms and any
+/// metadata failure return an explicit error; identity is never guessed.
+pub fn file_identity(path: &Path) -> Result<(String, String), io::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::file_identity(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::file_identity(path)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::file_identity(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = path;
+        Err(io::Error::other(
+            "file identity is not supported on this platform",
+        ))
+    }
+}
+
+/// Shared Unix implementation: the `st_dev`/`st_ino` pair from native
+/// metadata is the strongest identity available without elevated privileges.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_file_identity(path: &Path) -> Result<(String, String), io::Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok((
+        format!("unix-dev:{}", metadata.dev()),
+        format!("unix-ino:{}", metadata.ino()),
+    ))
+}
+
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
     allow(dead_code)
