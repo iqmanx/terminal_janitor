@@ -59,29 +59,71 @@ README.md
 
 No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
 
-## Planned CLI
+## Current CLI
 
 ```text
-terminal_janitor init
 terminal_janitor status
-terminal_janitor scan
-terminal_janitor check
-terminal_janitor clean
-terminal_janitor protect add <path>
-terminal_janitor protect remove <path>
-terminal_janitor protect list
-terminal_janitor history
-terminal_janitor enable
-terminal_janitor disable
+terminal_janitor status --json
 ```
 
-Global output options:
+`status` measures the volume containing the current working directory. It reads
+at most one small configuration file, calculates `Healthy` or `Pressure`,
+prints the result, and exits. It does not scan projects, open a database, invoke
+another command, or perform cleanup. Pressure is reported only.
+
+## Threshold configuration
+
+Running `status` never creates or changes configuration. If no configuration
+file exists, it uses clearly labelled conservative defaults:
 
 ```text
---json
---dry-run
---verbose
+minimum_free = 10 GiB
+target_free  = 15 GiB
 ```
+
+The exact `config.toml` path is resolved by the maintained `directories` crate:
+
+- Linux: `$XDG_CONFIG_HOME/terminal_janitor/config.toml`, or
+  `$HOME/.config/terminal_janitor/config.toml` when `XDG_CONFIG_HOME` is unset.
+- macOS: `$HOME/Library/Application Support/terminal_janitor/config.toml`.
+- Windows:
+  `{FOLDERID_RoamingAppData}\terminal_janitor\config\config.toml` (normally
+  beneath `%APPDATA%`).
+
+The file format is strict TOML:
+
+```toml
+minimum_free = "10GiB"
+target_free = "15GiB"
+```
+
+Sizes must be unsigned whole numbers followed immediately by one of the
+case-sensitive binary units `B`, `KiB`, `MiB`, `GiB`, or `TiB`. Decimal values,
+signs, whitespace, unknown units, overflow, zero `minimum_free`, and a
+`target_free` less than or equal to `minimum_free` are rejected. `GB` is not
+accepted or interpreted as `GiB`. An invalid existing file fails closed with
+`FAILED_CONFIGURATION`; it never falls back to defaults.
+
+## Status JSON
+
+`terminal_janitor status --json` writes only a stable JSON object:
+
+```json
+{
+  "result": "OK_NO_PRESSURE",
+  "state": "healthy",
+  "total_bytes": 274877906944,
+  "used_bytes": 216036854579,
+  "available_bytes": 58841052365,
+  "minimum_free_bytes": 10737418240,
+  "target_free_bytes": 16106127360,
+  "config_source": "defaults"
+}
+```
+
+Pressure uses `PRESSURE_DETECTED`; Day 1 never claims that a target was
+restored. Configuration failures exit 2, and storage-measurement failures exit
+3. JSON-mode failures remain valid JSON.
 
 ## Development loop
 
@@ -95,4 +137,7 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 
 ## Current state
 
-The repository contains the approved product and implementation documents. No implementation has been completed yet. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact next action.
+Day 1's read-only systems, configuration, and status CLI implementation is
+present. Cross-platform CI evidence is still required before the complete Day
+1 gate can be claimed. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)
+for the exact handover state.

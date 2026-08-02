@@ -1,9 +1,12 @@
-//! terminal_janitor systems foundation (Day 1A).
+//! terminal_janitor read-only foundation (Day 1).
 //!
-//! Exposes a platform-neutral disk-capacity model and a testable
-//! [`disk::DiskProvider`] abstraction. This is read-only: no configuration,
-//! discovery, planning, execution, or scheduling lives here yet.
+//! Exposes configuration, platform-neutral storage status, rendering, and a
+//! testable [`disk::DiskProvider`] abstraction. This remains read-only: no
+//! discovery, planning, cleanup execution, or scheduling lives here yet.
 
+pub mod cli;
+pub mod config;
 pub mod disk;
 pub mod model;
 mod platform;
+pub mod status;

@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Command-line parsing for the implemented Day 1 status command only.
+clap = { version = "4", features = ["derive"] }
+# Platform-native per-user application configuration directories.
+directories = "6"
 # Cross-platform total/available disk-space query (statvfs on Unix,
 # GetDiskFreeSpaceExW on Windows) without shelling out to df/wmic/PowerShell.
 fs4 = "1"
+# Stable machine-readable output and strict TOML configuration loading.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
 
 [dev-dependencies]
 # Isolated, auto-cleaned temp directories for filesystem-touching tests
