@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keeps SHA-pinned actions in ci.yml current; PRs update the pinned
+  # commit and its release comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
