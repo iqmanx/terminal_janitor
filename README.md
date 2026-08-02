@@ -138,6 +138,6 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 ## Current state
 
 Day 1's read-only systems, configuration, and status CLI implementation is
-present. Cross-platform CI evidence is still required before the complete Day
-1 gate can be claimed. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)
-for the exact handover state.
+complete. Ubuntu, macOS, and Windows CI pass. See
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact Day 2
+handover state.

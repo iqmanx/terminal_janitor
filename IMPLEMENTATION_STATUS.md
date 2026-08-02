@@ -7,7 +7,7 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Day 1A complete; Day 1B locally complete; cross-platform CI pending
+Current phase:  Day 1 complete; Day 2 not started
 ```
 
 ## Governing state
@@ -66,15 +66,14 @@ Evidence:
 
 ### Day 1 — Foundation and contracts
 
-Status: **implementation complete locally; full gate blocked pending cross-platform CI evidence**
+Status: **complete**
 
 `PLANS.md`/`BOOTSTRAP_PROMPT.md` describe Day 1 as a single unit. The owner's
 Day 1A/1B split further divides it: Day 1A delivered the read-only systems
 foundation; Day 1B connects it to strict threshold configuration and a
-read-only `status` CLI. Both implementation slices are present. The Day 1 gate
-also requires actual Ubuntu, macOS, and Windows CI success. No push was
-authorised for this work, so that evidence does not yet exist and Day 1 is not
-marked complete.
+read-only `status` CLI. Both implementation slices are present. GitHub Actions
+run `30749467277` passed format, Clippy, and tests on Ubuntu, macOS, and Windows,
+so the full Day 1 gate is complete.
 
 #### Day 1A — Architecture & systems foundation
 
@@ -149,8 +148,7 @@ git diff --check
 git status --short
 ```
 
-Automated test evidence (local, this machine — CI has not run yet, see
-limitations below):
+Automated test evidence recorded at the Day 1A handover, before Day 1B CI:
 
 - `cargo fmt --check`: pass (after one `cargo fmt` pass).
 - `cargo clippy --all-targets --all-features -- -D warnings`: pass, zero
@@ -175,7 +173,7 @@ Manual evidence:
   proot). Not yet run on macOS or Windows, and GitHub Actions CI has not
   executed (no push performed this session).
 
-Known limitations:
+Historical Day 1A limitations (the CI limitation is superseded below):
 
 - CI (`.github/workflows/ci.yml`) is written and matrix-configured for
   `ubuntu-latest`/`macos-latest`/`windows-latest` but has not actually run
@@ -209,13 +207,16 @@ platform-appropriate config/state directories, `status` and
 
 #### Day 1B — CLI, Configuration & Boilerplate
 
-Status: **implementation complete and locally validated; cross-platform gate pending**
+Status: **complete**
 
 Date: 2026-08-02
 
-Commit: `feat: add status CLI and threshold configuration` (this focused
-commit; SHA is reported in the handover because a commit cannot contain its
-own hash)
+Commits:
+
+- `f072a1f` — `feat: add status CLI and threshold configuration`
+- `c740ae5` — `fix: validate disk measurement paths`
+- `19b3801` — `test: isolate CLI volume fixtures`
+- `5f87fb3` — `test: preserve Windows known-folder resolution`
 
 Files changed:
 
@@ -227,6 +228,7 @@ src/main.rs
 src/cli.rs
 src/config.rs
 src/status.rs
+src/platform/mod.rs
 tests/cli_tests.rs
 README.md
 IMPLEMENTATION_STATUS.md
@@ -278,6 +280,14 @@ Automated test evidence:
 
 - pre-edit baseline: format pass, Clippy pass, 11/11 tests pass;
 - Day 1B local suite: 34/34 tests pass, 0 failed, 0 ignored;
+- [GitHub Actions run `30749467277`](https://github.com/iqmanx/terminal_janitor/actions/runs/30749467277):
+  success on Ubuntu, macOS, and Windows;
+- each CI job passed `cargo fmt --check`, strict Clippy, and all applicable
+  tests; Linux ran 34 tests and macOS/Windows ran 33 tests because the
+  invalid-XDG-config process test is Linux-specific;
+- the first Windows run exposed that `GetDiskFreeSpaceExW` can accept a
+  nonexistent child path; the provider now validates the requested path before
+  measuring, preserving the Day 1A exact-path contract on every platform;
 - size/config tests cover valid `10GiB`, byte boundaries, zero, unknown and
   wrong-case units, negative and decimal values, malformed values, overflow,
   equal/below target, corrupt TOML, absent defaults, invalid-file fail-closed,
@@ -301,33 +311,27 @@ Manual evidence:
 
 Known limitations:
 
-- GitHub Actions has not run this commit because pushing was not authorised.
-  Ubuntu/macOS/Windows CI passing is not claimed; this is the only blocker to
-  the complete Day 1 gate.
-- Local manual evidence is Linux/aarch64 only. macOS and Windows behavior is
-  supported through `directories`, `fs4`, platform seams, and CI-targeted
-  tests, but is not yet runtime evidence.
+- Local manual CLI smoke evidence is Linux/aarch64; macOS and Windows evidence
+  comes from the successful CI jobs.
 - Status measures the volume containing the current working directory.
 - Day 1 does not create configuration; users may place strict TOML at the
   documented conventional path until Day 2 adds `init`.
 - macOS APFS snapshot/purgeable-capacity ambiguity remains unresolved as
   recorded in Day 1A; Day 1 only reports raw capacity and performs no cleanup.
 
-Acceptance items supported locally:
+Acceptance items supported:
 
 - configurable and validated threshold model;
 - `status` performs no project walk or cleanup;
 - stable valid JSON and machine-readable Day 1 results;
 - local format, Clippy, and test checks pass;
 - Linux live CLI smoke and JSON-parser validation pass.
+- Ubuntu, macOS, and Windows CI pass for the final Day 1 commit.
 
-Blocker: cross-platform CI must pass before Day 1 overall may be recorded
-complete.
+Blockers: none for Day 1.
 
-Exact next action: push/open a PR only when authorised and confirm the existing
-Ubuntu/macOS/Windows CI matrix passes. Once that clears the Day 1 gate, begin
-**Day 2 — State, Registration & Read-Only Discovery**. Do not mark Day 2
-started before then.
+Exact next action: begin **Day 2 — State, Registration & Read-Only Discovery**.
+Do not add later-day cleanup, execution, or scheduling behavior.
 
 ### Days 2–7
 
@@ -370,15 +374,16 @@ tests/cli_tests.rs
 
 ## Exact next action
 
-The owner or next implementation agent should:
+The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
 2. Verify the repository and branch state.
-3. With owner authorisation, push/open a PR and confirm the existing
-   Ubuntu/macOS/Windows CI matrix passes for the Day 1B commit.
-4. Record the CI run and mark Day 1 complete only if all three jobs pass.
-5. Then begin **Day 2 — State, Registration & Read-Only Discovery**. Do not
-   add Day 2 behavior before the Day 1 platform gate clears.
+3. Begin **Day 2 — State, Registration & Read-Only Discovery** with bundled
+   SQLite, explicit migrations, atomic configuration writes, approved-root
+   registration, pnpm workspace discovery, canonical path/volume identity,
+   protection commands, and read-only `scan`.
+4. Keep all project discovery read-only and do not invoke pnpm or begin Day 3
+   proof/planning behavior.
 
 ## Required status-update format
 
@@ -403,7 +408,7 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Day 1 cross-platform CI evidence and Days 2–7 implementation remain outstanding
+Reason: Days 2–7 implementation and acceptance evidence remain outstanding
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.
