@@ -59,12 +59,63 @@ README.md
 
 No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
 
-## Current CLI
+## Current CLI (Day 2)
 
 ```text
+terminal_janitor init --root <path> [--root <path> ...]
+terminal_janitor scan
+terminal_janitor scan --json
+terminal_janitor protect add <path>
+terminal_janitor protect remove <path>
+terminal_janitor protect list
 terminal_janitor status
 terminal_janitor status --json
 ```
+
+`init` requires at least one explicit `--root`; it never guesses the home
+directory or a conventional projects directory. Optional `--minimum-free` and
+`--target-free` values use the strict size syntax below. Inputs must exist and
+be directories. Each root is canonicalised, bound to its native volume and
+file identity, and written to configuration and state as one coordinated
+transaction. Filesystem roots/whole system drives and root paths whose final
+component is a symbolic link are rejected. Repeating the same registration is
+idempotent. `init` neither scans nor enables scheduling.
+
+`scan` is explicitly invoked and entirely read-only with respect to projects.
+It scans only registered approved roots, invokes neither pnpm nor another
+package tool, executes no package script or shell, and performs no cleanup. A
+pnpm workspace is recognised only when these three regular files occur in the
+same directory:
+
+```text
+package.json
+pnpm-workspace.yaml
+pnpm-lock.yaml
+```
+
+Discovery does not recurse into `.git` or `node_modules`, never follows a
+symbolic directory link, caps traversal at 64 directory levels, and retains at
+most 1,000 diagnostics per scan. These exclusions exist only for traversal
+safety/performance; they grant no deletion authority. Nested roots are
+validated separately but their shared subtree is walked once, and a workspace
+is bound deterministically to its most specific approved root. A contained
+mount remains allowed and keeps its own `VolumeId`. Permission failures,
+identity changes, disappearing paths, partial workspace markers, and
+unavailable roots are reported with stable exact reasons rather than treated
+as absence.
+
+The observation ledger records marker modification time plus bounded Git HEAD
+and index fingerprints. It does not use filesystem access time. Git worktree
+state remains explicitly `unknown` in Day 2 because no Git process or shell is
+invoked. Activity may move forward but never backwards; first observation and
+protection remain stable. Missing workspaces remain in state, including their
+protection, and a moved workspace receives a new identity and fresh history.
+
+Protection commands accept only the exact live root of a registered workspace.
+Add and remove are idempotent, and protection persists across scans, process
+restarts, and schema migration. `protect list --json`, `protect add ... --json`,
+and `protect remove ... --json` are also supported through the global JSON
+option.
 
 `status` measures the volume containing the current working directory. It reads
 at most one small configuration file, calculates `Healthy` or `Pressure`,
@@ -108,9 +159,37 @@ accepted or interpreted as `GiB`. An invalid existing file fails closed with
 `approved_roots` is optional and defaults to an empty list, so Day 1
 configuration files remain valid unchanged. When present it must contain
 absolute paths; entries are sorted and de-duplicated deterministically, and a
-relative entry fails closed. The Day 2B `init`/registration workflow will be
-the normal way to populate it. No current command performs any cleanup based
-on this list.
+relative entry fails closed. `init` is the supported way to populate it. No
+current command performs cleanup based on this list.
+
+## Scan JSON
+
+JSON uses stable field and enum names. A successful scan has this shape (the
+workspace summary objects include identity, protection, status, Git state, and
+observation timestamps):
+
+```json
+{
+  "result": "SCAN_COMPLETE",
+  "approved_roots": 1,
+  "roots_scanned": 1,
+  "registered": [],
+  "updated": [],
+  "excluded": [],
+  "unavailable_roots": [],
+  "missing": [],
+  "protected_workspaces": 0,
+  "cleanup_performed": false
+}
+```
+
+When relevant exclusions exist, `result` is
+`SCAN_COMPLETE_WITH_EXCLUSIONS`. Stable reasons include
+`outside_approved_root`, `root_unavailable`, `root_identity_changed`,
+`symlink_not_followed`, `permission_denied`, `missing_package_json`,
+`missing_pnpm_workspace`, `missing_pnpm_lockfile`,
+`canonicalisation_failed`, `volume_identity_unavailable`,
+`duplicate_identity`, `path_changed_during_scan`, and `unsupported_path`.
 
 ## Status JSON
 
@@ -145,11 +224,12 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 
 ## Current state
 
-Day 1's read-only systems, configuration, and status CLI implementation is
-complete with Ubuntu, macOS, and Windows CI passing. Day 2A added the internal
-state foundation: a bundled-SQLite metadata ledger with explicit transactional
-migrations and fail-closed corruption handling, canonical volume-bound path
-identity, and atomic configuration writes. No new CLI commands, discovery,
-pnpm integration, or cleanup behaviour exist yet. See
-[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact Day 2B
-handover state.
+Day 1 and Day 2A are complete with their recorded cross-platform CI evidence.
+Day 2B implements explicit registration, bounded read-only pnpm workspace
+discovery, conservative activity observations, missing-workspace retention,
+and persistent exact-workspace protection. Local format, strict Clippy, tests,
+and live fixture workflows pass; cross-platform CI for the unpushed Day 2B
+commit is still required before the complete Day 2 gate can be marked passed.
+No pnpm adapter, planning, proof, cleanup, execution, or scheduling behaviour
+exists yet. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the
+exact handover state.

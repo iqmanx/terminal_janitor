@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -7,31 +7,66 @@ use crate::config::{ConfigError, load_config_at};
 use crate::disk::DiskProvider;
 use crate::model::DiskError;
 use crate::status::{StorageStatus, render_human, render_json};
+use crate::workflows::{
+    InitOptions, InitReport, ProtectionListReport, ProtectionReport, ScanReport, WorkflowError,
+    initialise, list_protection, scan, set_protection,
+};
 
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_FAILED_CONFIGURATION: u8 = 2;
 pub const EXIT_FAILED_STORAGE_MEASUREMENT: u8 = 3;
 pub const EXIT_FAILED_OUTPUT: u8 = 4;
+pub const EXIT_FAILED_STATE: u8 = 5;
+pub const EXIT_FAILED_ROOT_VALIDATION: u8 = 6;
+pub const EXIT_FAILED_DISCOVERY: u8 = 7;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "terminal_janitor",
     version,
-    about = "Conservative storage status for developer machines"
+    about = "Conservative storage governance for developer machines"
 )]
 pub struct Cli {
+    /// Emit stable machine-readable JSON
+    #[arg(long, global = true)]
+    pub json: bool,
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Report storage pressure without scanning or cleanup
-    Status {
-        /// Emit stable machine-readable JSON
+    /// Explicitly register one or more approved project roots
+    Init {
+        /// Approved project root; repeat for more roots
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+        /// Cleanup trigger threshold (for example 10GiB)
         #[arg(long)]
-        json: bool,
+        minimum_free: Option<String>,
+        /// Recovery target threshold (for example 15GiB)
+        #[arg(long)]
+        target_free: Option<String>,
     },
+    /// Discover pnpm workspaces read-only beneath approved roots
+    Scan,
+    /// Manage exact registered-workspace protection
+    Protect {
+        #[command(subcommand)]
+        command: ProtectCommand,
+    },
+    /// Report storage pressure without scanning or cleanup
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProtectCommand {
+    /// Protect an exact registered workspace root
+    Add { path: PathBuf },
+    /// Remove protection from an exact registered workspace root
+    Remove { path: PathBuf },
+    /// List protected registered workspaces
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +74,42 @@ pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: u8,
+}
+
+pub fn execute_init(
+    json: bool,
+    config_path: &Path,
+    state_path: &Path,
+    options: InitOptions,
+) -> CommandOutput {
+    match initialise(config_path, state_path, options) {
+        Ok(report) => render_serializable(json, &report, render_init_human(&report)),
+        Err(error) => workflow_failure(json, &error),
+    }
+}
+
+pub fn execute_scan(json: bool, config_path: &Path, state_path: &Path) -> CommandOutput {
+    match scan(config_path, state_path) {
+        Ok(report) => render_serializable(json, &report, render_scan_human(&report)),
+        Err(error) => workflow_failure(json, &error),
+    }
+}
+
+pub fn execute_protection(json: bool, state_path: &Path, command: ProtectCommand) -> CommandOutput {
+    match command {
+        ProtectCommand::Add { path } => match set_protection(state_path, &path, true) {
+            Ok(report) => render_serializable(json, &report, render_protection_human(&report)),
+            Err(error) => workflow_failure(json, &error),
+        },
+        ProtectCommand::Remove { path } => match set_protection(state_path, &path, false) {
+            Ok(report) => render_serializable(json, &report, render_protection_human(&report)),
+            Err(error) => workflow_failure(json, &error),
+        },
+        ProtectCommand::List => match list_protection(state_path) {
+            Ok(report) => render_serializable(json, &report, render_protection_list_human(&report)),
+            Err(error) => workflow_failure(json, &error),
+        },
+    }
 }
 
 impl CommandOutput {
@@ -109,7 +180,7 @@ pub fn storage_path_failure(json: bool, error: &DiskError) -> CommandOutput {
     )
 }
 
-fn render_failure(
+pub fn render_failure(
     json: bool,
     result: &'static str,
     error: &dyn std::fmt::Display,
@@ -146,6 +217,144 @@ fn render_failure(
     }
 }
 
+fn render_serializable<T: Serialize>(json: bool, value: &T, human: String) -> CommandOutput {
+    if !json {
+        return CommandOutput::success(human);
+    }
+    match serde_json::to_string_pretty(value) {
+        Ok(mut stdout) => {
+            stdout.push('\n');
+            CommandOutput::success(stdout)
+        }
+        Err(error) => render_failure(true, "FAILED_OUTPUT", &error, EXIT_FAILED_OUTPUT),
+    }
+}
+
+fn workflow_failure(json: bool, error: &WorkflowError) -> CommandOutput {
+    match error {
+        WorkflowError::Configuration(_) => render_failure(
+            json,
+            "FAILED_CONFIGURATION",
+            error,
+            EXIT_FAILED_CONFIGURATION,
+        ),
+        WorkflowError::State(_) => render_failure(json, "FAILED_STATE", error, EXIT_FAILED_STATE),
+        WorkflowError::RootValidation { .. }
+        | WorkflowError::UnknownWorkspace { .. }
+        | WorkflowError::AmbiguousWorkspace { .. } => render_failure(
+            json,
+            "FAILED_ROOT_VALIDATION",
+            error,
+            EXIT_FAILED_ROOT_VALIDATION,
+        ),
+    }
+}
+
+fn render_init_human(report: &InitReport) -> String {
+    let mut output = format!(
+        "terminal_janitor initialised\nApproved roots: {}\nMinimum free: {} bytes\nTarget free: {} bytes\n",
+        report.approved_roots.len(),
+        report.minimum_free_bytes,
+        report.target_free_bytes
+    );
+    for root in &report.approved_roots {
+        output.push_str(&format!("{}\n", root.display()));
+    }
+    output.push_str("Scheduling was not enabled. Scan was not run.\n");
+    output
+}
+
+fn render_scan_human(report: &ScanReport) -> String {
+    let mut output = format!(
+        "Workspace scan\nApproved roots: {}\nRoots scanned: {}\nWorkspaces registered: {}\nWorkspaces updated: {}\nExcluded candidates: {}\nUnavailable roots: {}\nMissing workspaces: {}\nProtected workspaces: {}\n",
+        report.approved_roots,
+        report.roots_scanned,
+        report.registered.len(),
+        report.updated.len(),
+        report.excluded.len(),
+        report.unavailable_roots.len(),
+        report.missing.len(),
+        report.protected_workspaces,
+    );
+    if !report.registered.is_empty() {
+        output.push_str("\nRegistered\n");
+        for workspace in &report.registered {
+            output.push_str(&format!(
+                "{}{}\n",
+                workspace.path.display(),
+                if workspace.protected {
+                    " [protected]"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    if !report.updated.is_empty() {
+        output.push_str("\nUpdated\n");
+        for workspace in &report.updated {
+            output.push_str(&format!(
+                "{}{}\n",
+                workspace.path.display(),
+                if workspace.protected {
+                    " [protected]"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    if !report.excluded.is_empty() {
+        output.push_str("\nExcluded\n");
+        for exclusion in &report.excluded {
+            output.push_str(&format!(
+                "{}\nReason: {}\n",
+                exclusion.path.display(),
+                exclusion.reason
+            ));
+        }
+    }
+    if !report.unavailable_roots.is_empty() {
+        output.push_str("\nUnavailable approved roots\n");
+        for root in &report.unavailable_roots {
+            output.push_str(&format!(
+                "{}\nReason: {}\n",
+                root.path.display(),
+                root.reason
+            ));
+        }
+    }
+    if !report.missing.is_empty() {
+        output.push_str("\nMissing\n");
+        for workspace in &report.missing {
+            output.push_str(&format!("{}\n", workspace.path.display()));
+        }
+    }
+    output.push_str("\nNo cleanup was performed.\n");
+    output
+}
+
+fn render_protection_human(report: &ProtectionReport) -> String {
+    format!(
+        "{}\nWorkspace: {}\nProtected: {}\n",
+        report.result,
+        report.workspace.path.display(),
+        report.workspace.protected
+    )
+}
+
+fn render_protection_list_human(report: &ProtectionListReport) -> String {
+    let mut output = format!("Protected workspaces: {}\n", report.protected.len());
+    for workspace in &report.protected {
+        output.push_str(&format!(
+            "{} [{}]\n",
+            workspace.path.display(),
+            workspace.status
+        ));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -167,8 +376,13 @@ mod tests {
     fn help_and_version_are_real_clap_outputs() {
         let help = Cli::try_parse_from(["terminal_janitor", "--help"]).unwrap_err();
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
-        assert!(help.to_string().contains("status"));
-        assert!(!help.to_string().contains("\n  clean "));
+        let help = help.to_string();
+        for command in ["init", "scan", "protect", "status"] {
+            assert!(help.contains(command));
+        }
+        for later in ["check", "clean", "history", "enable", "disable"] {
+            assert!(!help.contains(&format!("\n  {later}")));
+        }
 
         let version = Cli::try_parse_from(["terminal_janitor", "--version"]).unwrap_err();
         assert_eq!(version.kind(), ErrorKind::DisplayVersion);
@@ -235,5 +449,56 @@ mod tests {
         let output = execute_status(false, &config_path, root.path(), &fake);
         assert_eq!(output.exit_code, EXIT_SUCCESS);
         assert!(output.stdout.contains("Configuration: File"));
+    }
+
+    #[test]
+    fn day_two_human_outputs_are_truthful() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        for marker in ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"] {
+            fs::write(workspace.join(marker), b"fixture").unwrap();
+        }
+        let config = dir.path().join("config/config.toml");
+        let state = dir.path().join("state/state.sqlite3");
+        let missing_root = execute_init(
+            true,
+            &config,
+            &state,
+            InitOptions {
+                roots: vec![],
+                minimum_free: None,
+                target_free: None,
+            },
+        );
+        assert_eq!(missing_root.exit_code, EXIT_FAILED_ROOT_VALIDATION);
+        let failure: serde_json::Value = serde_json::from_str(&missing_root.stdout).unwrap();
+        assert_eq!(failure["result"], "FAILED_ROOT_VALIDATION");
+
+        let init = execute_init(
+            false,
+            &config,
+            &state,
+            InitOptions {
+                roots: vec![root],
+                minimum_free: None,
+                target_free: None,
+            },
+        );
+        assert_eq!(init.exit_code, EXIT_SUCCESS);
+        assert!(init.stdout.contains("terminal_janitor initialised"));
+        assert!(init.stdout.contains("Scheduling was not enabled"));
+        assert!(init.stdout.contains("Scan was not run"));
+
+        let scan = execute_scan(false, &config, &state);
+        assert_eq!(scan.exit_code, EXIT_SUCCESS);
+        assert!(scan.stdout.contains("Workspace scan"));
+        assert!(scan.stdout.contains("Workspaces registered: 1"));
+        assert!(scan.stdout.contains("No cleanup was performed"));
+
+        let list = execute_protection(false, &state, ProtectCommand::List);
+        assert_eq!(list.exit_code, EXIT_SUCCESS);
+        assert_eq!(list.stdout, "Protected workspaces: 0\n");
     }
 }

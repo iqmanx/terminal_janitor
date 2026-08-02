@@ -7,7 +7,7 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Day 1 complete; Day 2A complete; Day 2B not started
+Current phase:  Day 1 and Day 2A complete; Day 2B locally complete, CI pending
 ```
 
 ## Governing state
@@ -338,9 +338,9 @@ Do not add later-day cleanup, execution, or scheduling behavior.
 `PLANS.md` describes Day 2 as one unit. The owner's Day 2A/2B split further
 divides it: Day 2A delivered the persistent, fail-closed state and identity
 foundation; Day 2B connects it to `init`, approved-root registration,
-read-only pnpm workspace discovery, protection commands, and `scan`. Only
-Day 2A is complete; the full Day 2 gate (`scan` lists registered workspaces
-with exact exclusion reasons) remains open until Day 2B.
+read-only pnpm workspace discovery, protection commands, and `scan`. Day 2B's
+implementation and local gate pass; the complete Day 2 gate remains open only
+because the unpushed Day 2B commit has no Ubuntu/macOS/Windows CI result yet.
 
 #### Day 2A — State Ledger & Identity Safety
 
@@ -558,7 +558,179 @@ pnpm workspace discovery beneath approved roots, protection commands, and
 `scan`), strictly on top of the Day 2A state API. Do not begin Day 3
 planning/proof behaviour.
 
-### Days 2B–7
+#### Day 2B — Registration, Discovery & CLI Workflows
+
+Status: **implementation complete locally; complete Day 2 gate pending cross-platform CI**
+
+Date: 2026-08-02
+
+Commits:
+
+- focused Day 2B commit `feat: add workspace registration and read-only discovery`
+  (SHA is reported by the handover after the commit is created; this file
+  cannot contain the hash of the commit that contains it).
+
+Files changed:
+
+```text
+src/activity.rs       (new)
+src/discovery.rs      (new)
+src/workflows.rs      (new)
+src/cli.rs
+src/lib.rs
+src/main.rs
+src/state.rs
+tests/cli_tests.rs
+README.md
+IMPLEMENTATION_STATUS.md
+```
+
+Dependencies added and why:
+
+- None. Day 2B uses the existing standard library, serde, directories,
+  rusqlite, dunce, and tempfile dependencies.
+
+Delivered:
+
+- `init --root <path>` with repeatable explicit roots, optional strict
+  thresholds, canonical/volume/file identity, filesystem-root and symlink-root
+  rejection, deterministic deduplication, no inferred home/project roots, no
+  scheduling, and no automatic scan;
+- coordinated atomic config plus transactional root registration: config
+  writer failure rolls back all root rows and removes a newly-created empty
+  state file; state failure leaves the old config unchanged; a rare state
+  commit failure after config replacement invokes a compensating atomic config
+  rollback;
+- schema v2 migration adding retained `missing` workspace status and bounded
+  Git state/fingerprints while preserving v1 protection data;
+- bounded discovery only beneath approved canonical roots, with no symlink
+  following, no `.git`/`node_modules` recursion, depth limit 64, diagnostic cap
+  1,000, canonical containment checks at every visited directory, deterministic
+  nested-root ownership, duplicate physical-identity collapse, and contained
+  mounted-volume identity preservation;
+- exact stable exclusion reasons for partial markers, permissions,
+  disappearing/unsupported paths, symlinks, identity failures, changed or
+  unavailable roots, outside-root paths, and duplicates;
+- valid pnpm workspace recognition only when `package.json`,
+  `pnpm-workspace.yaml`, and `pnpm-lock.yaml` are regular files in one directory;
+- conservative activity from marker mtimes, bounded `.git/HEAD`/loose-ref/
+  `packed-refs` fingerprints, and Git index mtime/length; access time is never
+  read; worktree state is explicitly `unknown` because Day 2 invokes no Git;
+- one-transaction scan observation upsert/missing marking with stable first
+  observation, forward-only last observation/activity, unchanged
+  `last_cleaned_at`, and protection never cleared; uncertain permission/
+  canonicalisation/volume/depth prefixes do not falsely mark known workspaces
+  missing;
+- moved/replaced workspaces receive new IDs and no inherited protection or
+  observation authority; absent workspaces and their protection remain stored;
+- exact registered-workspace `protect add`, `protect remove`, and `protect list`
+  with idempotent updates, persistent state, and no identity bypass;
+- stable human and JSON output for init, scan, protection, and the unchanged
+  read-only status command; no later-day CLI placeholders.
+
+Commands run locally:
+
+```text
+git status --short --branch
+git log --oneline -15
+git diff --check
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+terminal_janitor --help
+terminal_janitor --version
+terminal_janitor status
+terminal_janitor status --json
+terminal_janitor init --root <generated-fixture-root>
+terminal_janitor init --root <generated-fixture-root> --json
+terminal_janitor scan
+terminal_janitor scan --json
+terminal_janitor protect add <generated-fixture-workspace>
+terminal_janitor protect list
+terminal_janitor protect list --json
+terminal_janitor protect remove <generated-fixture-workspace>
+```
+
+Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
+
+- pre-edit Day 2A baseline: format pass, strict Clippy pass, 74/74 tests pass;
+- Day 2B final local suite: 101/101 tests pass, 0 failed, 0 ignored (95 unit +
+  6 actual-binary integration tests);
+- init tests cover explicit-root requirement, canonical registration, missing/
+  file/filesystem-root/symlink rejection, duplicate idempotency, threshold
+  preservation/validation, injected config-write rollback, injected state
+  conflict preserving config, and explicit no-schedule/no-scan results;
+- discovery tests cover all marker combinations, approved-root containment,
+  symlink escape/loop non-following, nested/overlapping roots, injected child
+  volume identity, permission/disappearing paths, Unicode/spaces, deterministic
+  ordering, and repeated discovery;
+- activity/state tests cover marker and lock observations, HEAD/index
+  fingerprints, explicit unknown Git state, stable first observation,
+  forward-only activity, v1→v2 protection-preserving migration, bounded rows,
+  moved/replaced/missing identity behaviour, and protection across rescan/reopen;
+- CLI instrumentation places fake `pnpm`, `npm`, `node`, `git`, `sh`, and
+  `bash` executables first on `PATH`; scan invokes none, and before/after marker
+  contents plus modification times are identical;
+- all tested JSON is parsed with `serde_json`; live JSON evidence below was
+  parsed by Python's standard `json` parser.
+
+Manual evidence:
+
+- generated Linux fixture with spaces and Unicode completed human `status`,
+  `init`, `scan`, protection add/list/remove, plus JSON status/init/scan/list;
+- every live JSON stream parsed successfully with a real JSON parser;
+- repeated init returned the same canonical approved root and repeated scan
+  updated the existing workspace instead of appending a row;
+- SHA-256 snapshots of all three project markers matched before and after all
+  workflows; no cleanup was performed;
+- source inspection confirms production contains no `std::process::Command`,
+  shell, pnpm invocation, package-script execution, planner, `ProofBundle`,
+  `AllowedAction`, cleanup plan, or project write API; discovery/activity expose
+  reads only, while writes are limited to atomic config, SQLite state, private
+  state directories, and exact rollback of newly written product-state files;
+- schema inspection confirms rows scale with approved roots and workspaces,
+  not visited directories; traversal retains only a bounded stack, a per-root
+  visited identity set for the current scan, workspace observations, and at
+  most 1,000 diagnostics.
+
+Known limitations:
+
+- Day 2 deliberately reports Git worktree state as `unknown`; it observes HEAD
+  and index movement without invoking Git. Day 3 may strengthen this behind the
+  separable activity probe without changing registration identity.
+- Paths not representable in UTF-8 fail closed, matching Day 2A.
+- A final-component symlink is rejected for approved-root registration;
+  symlinks in ancestor spelling are resolved to the exact canonical root, and
+  no directory symlink encountered below it is followed.
+- Local manual evidence is Linux/aarch64. The new Day 2B commit has not been
+  pushed (owner prohibited pushing), so Ubuntu, macOS, and Windows CI results
+  are not yet available. Prior Day 2A CI is green but does not qualify Day 2B.
+
+Acceptance items supported:
+
+- E (Day 2 scope): only approved roots are inspected; canonical path and volume
+  identity are stored; discovery cannot escape; names grant no authority; no
+  project write occurs;
+- F (Day 2 scope): explicit protection persists across scans/reopen/migration;
+- I (Day 2 scope): explicit migration, corruption failure, atomic config, 20 MiB
+  database bound, and metadata-only state;
+- L (Day 2 scope): status remains no-walk/read-only, scan is read-only, JSON is
+  valid/stable, exclusions are exact, and human output states no cleanup;
+- D (discovery prerequisite only): all three pnpm markers are required and
+  instrumentation proves pnpm/project scripts are not invoked.
+
+Blockers:
+
+- The complete Day 2 gate is not yet claimable because required Ubuntu, macOS,
+  and Windows CI has not run for this unpushed commit. No implementation or
+  local-test blocker remains.
+
+Exact next action: push/open CI when authorised and require Ubuntu, macOS, and
+Windows to pass for the Day 2B commit; then mark the complete Day 2 gate passed
+and begin **Day 3 — Pnpm Adapter, Proof Gates & Planning**. Do not start Day 3
+before that CI evidence exists.
+
+### Days 3–7
 
 Status: **not started**
 
@@ -566,12 +738,11 @@ Follow `PLANS.md` strictly. Do not begin a later day until the current day's man
 
 ## Current repository contents
 
-Days 1 and 2A contain the systems, configuration, status/CLI, identity, and
-state-ledger foundation. Still intentionally absent (Day 2B and later scope):
+Days 1, 2A, and 2B contain the systems, configuration, status/CLI, identity,
+state ledger, registration, discovery, activity-observation, and protection
+foundation. Still intentionally absent (Day 3 and later scope):
 
 ```text
-src/activity.rs
-src/protection.rs
 src/planner.rs
 src/executor.rs
 src/journal.rs
@@ -579,7 +750,7 @@ src/adapters/
 scripts/
 ```
 
-Their absence is not a defect at this point in the plan. Present after Day 2A:
+Their absence is not a defect at this point in the plan. Present after Day 2B:
 
 ```text
 Cargo.toml
@@ -588,9 +759,12 @@ src/lib.rs
 src/main.rs
 src/cli.rs
 src/config.rs
+src/activity.rs
+src/discovery.rs
 src/identity.rs
 src/state.rs
 src/status.rs
+src/workflows.rs
 src/model.rs
 src/disk.rs
 src/platform/
@@ -603,15 +777,12 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Verify the repository and branch state (Day 2A CI is green on all three
-   operating systems as of run `30754968125`).
-3. Begin **Day 2B — Registration, Discovery & CLI Workflows**: `init`,
-   approved-root registration (writing configuration through
-   `config::save_config_at`), read-only pnpm workspace discovery beneath
-   approved roots recording observations through the `state::StateStore`
-   API, protection commands, and read-only `scan`.
-4. Keep all project discovery read-only and do not invoke pnpm or begin Day 3
-   proof/planning behavior.
+2. Push/open CI only when authorised and require the Day 2B commit to pass
+   Ubuntu, macOS, and Windows format, strict Clippy, and all tests.
+3. Record those CI URLs/results and mark the complete Day 2 gate passed only
+   if all three jobs pass without ignored safety tests.
+4. Then begin **Day 3 — Pnpm Adapter, Proof Gates & Planning**. Do not start
+   Day 3 before cross-platform Day 2B evidence exists.
 
 ## Required status-update format
 
@@ -636,7 +807,7 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Days 2–7 implementation and acceptance evidence remain outstanding
+Reason: Day 2B cross-platform CI and Days 3–7 remain outstanding
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.

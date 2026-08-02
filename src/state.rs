@@ -26,7 +26,7 @@ use crate::identity::{CanonicalPath, FileId, IdentityError, PathIdentity, Volume
 pub const MAX_STATE_DB_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Current schema version; equals the number of entries in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Ordered, explicit migrations. Each entry upgrades the schema by exactly
 /// one version and runs inside one transaction together with the version
@@ -65,6 +65,40 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE UNIQUE INDEX workspaces_present_by_path
         ON workspaces (volume_id, canonical_path) WHERE status = 'present';
+    CREATE INDEX workspaces_by_file
+        ON workspaces (volume_id, file_id);",
+    // v2: retain absent workspaces and the bounded fingerprints needed to
+    // detect Git HEAD/index movement without storing project contents.
+    "ALTER TABLE workspaces RENAME TO workspaces_v1;
+    CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL,
+        approved_root_id TEXT NOT NULL REFERENCES approved_roots (id),
+        volume_id TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        first_observed_at INTEGER NOT NULL,
+        last_observed_at INTEGER NOT NULL,
+        last_activity_at INTEGER NOT NULL,
+        last_cleaned_at INTEGER,
+        protected INTEGER NOT NULL CHECK (protected IN (0, 1)),
+        status TEXT NOT NULL CHECK (status IN ('present', 'missing', 'replaced')),
+        git_state TEXT NOT NULL CHECK (git_state IN ('unknown', 'clean', 'dirty')),
+        git_head_fingerprint TEXT,
+        git_index_fingerprint TEXT
+    ) STRICT;
+    INSERT INTO workspaces
+        (id, canonical_path, approved_root_id, volume_id, file_id,
+         first_observed_at, last_observed_at, last_activity_at,
+         last_cleaned_at, protected, status, git_state,
+         git_head_fingerprint, git_index_fingerprint)
+    SELECT id, canonical_path, approved_root_id, volume_id, file_id,
+           first_observed_at, last_observed_at, last_activity_at,
+           last_cleaned_at, protected, status, 'unknown', NULL, NULL
+    FROM workspaces_v1;
+    DROP TABLE workspaces_v1;
+    CREATE UNIQUE INDEX workspaces_live_by_path
+        ON workspaces (volume_id, canonical_path)
+        WHERE status IN ('present', 'missing');
     CREATE INDEX workspaces_by_file
         ON workspaces (volume_id, file_id);",
 ];
@@ -141,6 +175,9 @@ impl fmt::Display for WorkspaceId {
 pub enum WorkspaceStatus {
     /// The workspace was present at its canonical path when last observed.
     Present,
+    /// The owning approved root was scanned successfully, but the workspace
+    /// was not observed. Its identity and protection remain in the ledger.
+    Missing,
     /// A different physical directory now occupies this record's canonical
     /// path; the record is retained (including its protection flag) but no
     /// longer carries live authority.
@@ -151,7 +188,34 @@ impl WorkspaceStatus {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "present" => Some(Self::Present),
+            "missing" => Some(Self::Missing),
             "replaced" => Some(Self::Replaced),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitState {
+    Unknown,
+    Clean,
+    Dirty,
+}
+
+impl GitState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Clean => "clean",
+            Self::Dirty => "dirty",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "clean" => Some(Self::Clean),
+            "dirty" => Some(Self::Dirty),
             _ => None,
         }
     }
@@ -185,6 +249,12 @@ pub struct WorkspaceObservation {
     /// unknown-activity workspace as recently active delays cleanup, never
     /// accelerates it. Existing records never move backwards.
     pub activity_at: Option<Timestamp>,
+    /// Day 2 records uncertainty explicitly. The production filesystem probe
+    /// does not invoke Git, so worktree state is normally `Unknown` for now.
+    pub git_state: GitState,
+    /// Stable bounded fingerprints, never raw Git or project contents.
+    pub git_head_fingerprint: Option<String>,
+    pub git_index_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +270,33 @@ pub struct WorkspaceRecord {
     pub last_cleaned_at: Option<Timestamp>,
     pub protected: bool,
     pub status: WorkspaceStatus,
+    pub git_state: GitState,
+    pub git_head_fingerprint: Option<String>,
+    pub git_index_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedRoot {
+    pub id: ApprovedRootId,
+    pub identity: PathIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceChangeKind {
+    Registered,
+    Updated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceChange {
+    pub kind: WorkspaceChangeKind,
+    pub workspace: WorkspaceRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanStateResult {
+    pub changes: Vec<WorkspaceChange>,
+    pub missing: Vec<WorkspaceRecord>,
 }
 
 #[derive(Debug)]
@@ -344,6 +441,14 @@ pub struct SqliteStateStore {
     db_path: PathBuf,
     clock: Box<dyn Clock>,
     max_db_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum CoordinatedWriteError<E> {
+    State(StateError),
+    External(E),
+    StateCommit(StateError),
+    StateCommitAndRollback { state: StateError, rollback: E },
 }
 
 impl fmt::Debug for SqliteStateStore {
@@ -512,6 +617,161 @@ impl SqliteStateStore {
             .map_err(|error| map_op_error(&db_path, &error))?;
         Ok(value)
     }
+
+    /// Registers a complete root set in one SQLite transaction while an
+    /// external atomic writer persists the matching configuration before the
+    /// database commit. A failed writer rolls SQLite back; a failed database
+    /// commit invokes the supplied compensating config rollback.
+    pub fn register_approved_roots_coordinated<E>(
+        &mut self,
+        identities: &[PathIdentity],
+        persist_config: impl FnOnce(&[ApprovedRootRecord]) -> Result<(), E>,
+        rollback_config: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Vec<ApprovedRootRecord>, CoordinatedWriteError<E>> {
+        let size_before = Self::database_size(&self.conn)
+            .map_err(|error| CoordinatedWriteError::State(self.op_error(&error)))?;
+        if size_before > self.max_db_bytes {
+            return Err(CoordinatedWriteError::State(
+                StateError::SizeLimitExceeded {
+                    size_bytes: size_before,
+                    limit_bytes: self.max_db_bytes,
+                },
+            ));
+        }
+
+        let now = self.clock.now();
+        let db_path = self.db_path.clone();
+        let max_db_bytes = self.max_db_bytes;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|error| CoordinatedWriteError::State(map_op_error(&db_path, &error)))?;
+        let mut records = Vec::with_capacity(identities.len());
+        for identity in identities {
+            records.push(
+                add_root_tx(&tx, &db_path, identity, now).map_err(CoordinatedWriteError::State)?,
+            );
+        }
+        records.sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
+        records.dedup_by(|a, b| a.id == b.id);
+
+        let size_after = Self::database_size(&tx)
+            .map_err(|error| CoordinatedWriteError::State(map_op_error(&db_path, &error)))?;
+        if size_after > max_db_bytes {
+            return Err(CoordinatedWriteError::State(
+                StateError::SizeLimitExceeded {
+                    size_bytes: size_after,
+                    limit_bytes: max_db_bytes,
+                },
+            ));
+        }
+        persist_config(&records).map_err(CoordinatedWriteError::External)?;
+        if let Err(error) = tx.commit() {
+            let state = map_op_error(&db_path, &error);
+            return match rollback_config() {
+                Ok(()) => Err(CoordinatedWriteError::StateCommit(state)),
+                Err(rollback) => {
+                    Err(CoordinatedWriteError::StateCommitAndRollback { state, rollback })
+                }
+            };
+        }
+        Ok(records)
+    }
+
+    /// Applies one complete scan atomically. Only roots whose live identity
+    /// was revalidated participate; missing rows are retained, never deleted.
+    pub fn apply_scan(
+        &mut self,
+        validated_roots: &[ValidatedRoot],
+        observations: &[WorkspaceObservation],
+        uncertain_prefixes: &[PathBuf],
+    ) -> Result<ScanStateResult, StateError> {
+        let db_path = self.db_path.clone();
+        self.mutate(|tx, now| {
+            for root in validated_roots {
+                let raw = tx
+                    .query_row(
+                        &format!("SELECT {ROOT_COLUMNS} FROM approved_roots WHERE id = ?1"),
+                        params![root.id.as_str()],
+                        RawRoot::from_row,
+                    )
+                    .optional()
+                    .map_err(|error| map_op_error(&db_path, &error))?
+                    .ok_or_else(|| StateError::UnknownApprovedRoot {
+                        id: root.id.clone(),
+                    })?;
+                if raw.active == 0
+                    || raw.canonical_path != root.identity.canonical.as_str()
+                    || raw.volume_id != root.identity.volume.as_str()
+                    || raw.file_id != root.identity.file.as_str()
+                {
+                    return Err(StateError::ConflictingIdentity {
+                        message: format!(
+                            "approved root {} changed identity during scan",
+                            root.identity.canonical
+                        ),
+                    });
+                }
+                tx.execute(
+                    "UPDATE approved_roots SET last_validated_at = ?1 WHERE id = ?2",
+                    params![
+                        max_timestamp(raw.last_validated_at, now.0),
+                        root.id.as_str()
+                    ],
+                )
+                .map_err(|error| map_op_error(&db_path, &error))?;
+            }
+
+            let mut changes = Vec::with_capacity(observations.len());
+            let mut seen = std::collections::BTreeSet::new();
+            for observation in observations {
+                let (workspace, kind) = upsert_workspace_tx(tx, &db_path, observation, now)?;
+                seen.insert(workspace.id.as_str().to_owned());
+                changes.push(WorkspaceChange { kind, workspace });
+            }
+
+            let validated_ids: std::collections::BTreeSet<_> = validated_roots
+                .iter()
+                .map(|root| root.id.as_str().to_owned())
+                .collect();
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT {WORKSPACE_COLUMNS} FROM workspaces
+                     WHERE status IN ('present', 'missing')
+                     ORDER BY volume_id, canonical_path, id"
+                ))
+                .map_err(|error| map_op_error(&db_path, &error))?;
+            let existing = statement
+                .query_map([], RawWorkspace::from_row)
+                .map_err(|error| map_op_error(&db_path, &error))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| map_op_error(&db_path, &error))?;
+            drop(statement);
+
+            let mut missing = Vec::new();
+            for raw in existing {
+                let uncertain = uncertain_prefixes
+                    .iter()
+                    .any(|prefix| Path::new(&raw.canonical_path).starts_with(prefix));
+                if validated_ids.contains(&raw.approved_root_id)
+                    && !seen.contains(&raw.id)
+                    && !uncertain
+                {
+                    tx.execute(
+                        "UPDATE workspaces SET status = 'missing' WHERE id = ?1",
+                        params![raw.id],
+                    )
+                    .map_err(|error| map_op_error(&db_path, &error))?;
+                    let mut record = raw.into_record(&db_path)?;
+                    record.status = WorkspaceStatus::Missing;
+                    missing.push(record);
+                }
+            }
+            changes.sort_by(|a, b| a.workspace.canonical_path.cmp(&b.workspace.canonical_path));
+            missing.sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
+            Ok(ScanStateResult { changes, missing })
+        })
+    }
 }
 
 fn is_corruption(error: &rusqlite::Error) -> bool {
@@ -645,6 +905,9 @@ struct RawWorkspace {
     last_cleaned_at: Option<i64>,
     protected: i64,
     status: String,
+    git_state: String,
+    git_head_fingerprint: Option<String>,
+    git_index_fingerprint: Option<String>,
 }
 
 impl RawWorkspace {
@@ -661,6 +924,9 @@ impl RawWorkspace {
             last_cleaned_at: row.get(8)?,
             protected: row.get(9)?,
             status: row.get(10)?,
+            git_state: row.get(11)?,
+            git_head_fingerprint: row.get(12)?,
+            git_index_fingerprint: row.get(13)?,
         })
     }
 
@@ -668,6 +934,10 @@ impl RawWorkspace {
         let status = WorkspaceStatus::parse(&self.status).ok_or_else(|| StateError::Corrupt {
             path: db_path.to_path_buf(),
             message: format!("workspace row holds unknown status {:?}", self.status),
+        })?;
+        let git_state = GitState::parse(&self.git_state).ok_or_else(|| StateError::Corrupt {
+            path: db_path.to_path_buf(),
+            message: format!("workspace row holds unknown Git state {:?}", self.git_state),
         })?;
         Ok(WorkspaceRecord {
             id: WorkspaceId(self.id),
@@ -681,12 +951,16 @@ impl RawWorkspace {
             last_cleaned_at: self.last_cleaned_at.map(Timestamp),
             protected: self.protected != 0,
             status,
+            git_state,
+            git_head_fingerprint: self.git_head_fingerprint,
+            git_index_fingerprint: self.git_index_fingerprint,
         })
     }
 }
 
 const WORKSPACE_COLUMNS: &str = "id, canonical_path, approved_root_id, volume_id, file_id, \
-     first_observed_at, last_observed_at, last_activity_at, last_cleaned_at, protected, status";
+     first_observed_at, last_observed_at, last_activity_at, last_cleaned_at, protected, status, \
+     git_state, git_head_fingerprint, git_index_fingerprint";
 
 impl StateStore for SqliteStateStore {
     fn schema_version(&self) -> Result<u32, StateError> {
@@ -707,110 +981,7 @@ impl StateStore for SqliteStateStore {
         root: NewApprovedRoot,
     ) -> Result<ApprovedRootRecord, StateError> {
         let db_path = self.db_path.clone();
-        self.mutate(|tx, now| {
-            let identity = &root.identity;
-
-            // 1. Exact canonical identity already approved: return the
-            //    existing record (duplicates collapse deterministically).
-            let exact = tx
-                .query_row(
-                    &format!(
-                        "SELECT {ROOT_COLUMNS} FROM approved_roots
-                         WHERE volume_id = ?1 AND canonical_path = ?2 AND active = 1"
-                    ),
-                    params![identity.volume.as_str(), identity.canonical.as_str()],
-                    RawRoot::from_row,
-                )
-                .optional()
-                .map_err(|error| map_op_error(&db_path, &error))?;
-            if let Some(raw) = exact {
-                if raw.file_id != identity.file.as_str() {
-                    // Same path, different physical directory: the stored
-                    // authority is stale and must not silently transfer.
-                    return Err(StateError::ConflictingIdentity {
-                        message: format!(
-                            "approved root {} exists but points at a different \
-                             physical directory; re-approval is required",
-                            identity.canonical
-                        ),
-                    });
-                }
-                tx.execute(
-                    "UPDATE approved_roots SET last_validated_at = ?1 WHERE id = ?2",
-                    params![max_timestamp(raw.last_validated_at, now.0), raw.id],
-                )
-                .map_err(|error| map_op_error(&db_path, &error))?;
-                let mut record = raw.into_record()?;
-                record.last_validated_at =
-                    Timestamp(max_timestamp(record.last_validated_at.0, now.0));
-                return Ok(record);
-            }
-
-            // 2. Same physical directory under a different spelling. A
-            //    case-variant of the stored path (case-insensitive
-            //    filesystems) collapses into the existing record; any other
-            //    alias of the same physical directory is a conflict that a
-            //    human must resolve.
-            let same_file = tx
-                .query_row(
-                    &format!(
-                        "SELECT {ROOT_COLUMNS} FROM approved_roots
-                         WHERE volume_id = ?1 AND file_id = ?2 AND active = 1"
-                    ),
-                    params![identity.volume.as_str(), identity.file.as_str()],
-                    RawRoot::from_row,
-                )
-                .optional()
-                .map_err(|error| map_op_error(&db_path, &error))?;
-            if let Some(raw) = same_file {
-                if raw
-                    .canonical_path
-                    .eq_ignore_ascii_case(identity.canonical.as_str())
-                {
-                    tx.execute(
-                        "UPDATE approved_roots SET last_validated_at = ?1 WHERE id = ?2",
-                        params![max_timestamp(raw.last_validated_at, now.0), raw.id],
-                    )
-                    .map_err(|error| map_op_error(&db_path, &error))?;
-                    let mut record = raw.into_record()?;
-                    record.last_validated_at =
-                        Timestamp(max_timestamp(record.last_validated_at.0, now.0));
-                    return Ok(record);
-                }
-                return Err(StateError::ConflictingIdentity {
-                    message: format!(
-                        "the physical directory of {} is already approved as {}; \
-                         one directory must not hold two authorities",
-                        identity.canonical, raw.canonical_path
-                    ),
-                });
-            }
-
-            // 3. Genuinely new root.
-            let id = generate_id(tx, &db_path)?;
-            tx.execute(
-                "INSERT INTO approved_roots
-                 (id, canonical_path, volume_id, file_id, created_at, last_validated_at, active)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
-                params![
-                    id,
-                    identity.canonical.as_str(),
-                    identity.volume.as_str(),
-                    identity.file.as_str(),
-                    now.0,
-                ],
-            )
-            .map_err(|error| map_op_error(&db_path, &error))?;
-            Ok(ApprovedRootRecord {
-                id: ApprovedRootId(id),
-                canonical_path: identity.canonical.clone(),
-                volume_id: identity.volume.clone(),
-                file_id: identity.file.clone(),
-                created_at: now,
-                last_validated_at: now,
-                active: true,
-            })
-        })
+        self.mutate(|tx, now| add_root_tx(tx, &db_path, &root.identity, now))
     }
 
     fn list_approved_roots(&self) -> Result<Vec<ApprovedRootRecord>, StateError> {
@@ -834,78 +1005,7 @@ impl StateStore for SqliteStateStore {
         observation: WorkspaceObservation,
     ) -> Result<WorkspaceRecord, StateError> {
         let db_path = self.db_path.clone();
-        self.mutate(|tx, now| {
-            let identity = &observation.identity;
-
-            let root_exists: bool = tx
-                .query_row(
-                    "SELECT count(*) FROM approved_roots WHERE id = ?1 AND active = 1",
-                    params![observation.approved_root_id.as_str()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|count| count > 0)
-                .map_err(|error| map_op_error(&db_path, &error))?;
-            if !root_exists {
-                return Err(StateError::UnknownApprovedRoot {
-                    id: observation.approved_root_id.clone(),
-                });
-            }
-
-            // 1. A present record at this exact canonical location.
-            let exact = tx
-                .query_row(
-                    &format!(
-                        "SELECT {WORKSPACE_COLUMNS} FROM workspaces
-                         WHERE volume_id = ?1 AND canonical_path = ?2 AND status = 'present'"
-                    ),
-                    params![identity.volume.as_str(), identity.canonical.as_str()],
-                    RawWorkspace::from_row,
-                )
-                .optional()
-                .map_err(|error| map_op_error(&db_path, &error))?;
-            if let Some(raw) = exact {
-                if raw.file_id == identity.file.as_str() {
-                    return update_observed(tx, &db_path, raw, &observation, now);
-                }
-                // A different physical directory now sits at this path. The
-                // old record must not lend it any history: mark the old
-                // record replaced (its protection flag stays recorded) and
-                // register a brand-new workspace identity.
-                tx.execute(
-                    "UPDATE workspaces SET status = 'replaced' WHERE id = ?1",
-                    params![raw.id],
-                )
-                .map_err(|error| map_op_error(&db_path, &error))?;
-                return insert_workspace(tx, &db_path, &observation, now);
-            }
-
-            // 2. The same physical directory recorded under a case-variant
-            //    spelling (case-insensitive filesystems): same workspace.
-            let case_variant = tx
-                .query_row(
-                    &format!(
-                        "SELECT {WORKSPACE_COLUMNS} FROM workspaces
-                         WHERE volume_id = ?1 AND file_id = ?2 AND status = 'present'"
-                    ),
-                    params![identity.volume.as_str(), identity.file.as_str()],
-                    RawWorkspace::from_row,
-                )
-                .optional()
-                .map_err(|error| map_op_error(&db_path, &error))?;
-            if let Some(raw) = case_variant
-                && raw
-                    .canonical_path
-                    .eq_ignore_ascii_case(identity.canonical.as_str())
-            {
-                return update_observed(tx, &db_path, raw, &observation, now);
-            }
-
-            // 3. New workspace identity. (A physical directory observed at a
-            //    genuinely different path — a move — also lands here: the new
-            //    location starts with fresh history rather than inheriting
-            //    authority accumulated elsewhere.)
-            insert_workspace(tx, &db_path, &observation, now)
-        })
+        self.mutate(|tx, now| upsert_workspace_tx(tx, &db_path, &observation, now).map(|x| x.0))
     }
 
     fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<WorkspaceRecord>, StateError> {
@@ -958,6 +1058,172 @@ impl StateStore for SqliteStateStore {
     }
 }
 
+fn add_root_tx(
+    tx: &Transaction<'_>,
+    db_path: &Path,
+    identity: &PathIdentity,
+    now: Timestamp,
+) -> Result<ApprovedRootRecord, StateError> {
+    let exact = tx
+        .query_row(
+            &format!(
+                "SELECT {ROOT_COLUMNS} FROM approved_roots
+                 WHERE volume_id = ?1 AND canonical_path = ?2 AND active = 1"
+            ),
+            params![identity.volume.as_str(), identity.canonical.as_str()],
+            RawRoot::from_row,
+        )
+        .optional()
+        .map_err(|error| map_op_error(db_path, &error))?;
+    if let Some(raw) = exact {
+        if raw.file_id != identity.file.as_str() {
+            return Err(StateError::ConflictingIdentity {
+                message: format!(
+                    "approved root {} exists but points at a different physical directory; re-approval is required",
+                    identity.canonical
+                ),
+            });
+        }
+        tx.execute(
+            "UPDATE approved_roots SET last_validated_at = ?1 WHERE id = ?2",
+            params![max_timestamp(raw.last_validated_at, now.0), raw.id],
+        )
+        .map_err(|error| map_op_error(db_path, &error))?;
+        let mut record = raw.into_record()?;
+        record.last_validated_at = Timestamp(max_timestamp(record.last_validated_at.0, now.0));
+        return Ok(record);
+    }
+
+    let same_file = tx
+        .query_row(
+            &format!(
+                "SELECT {ROOT_COLUMNS} FROM approved_roots
+                 WHERE volume_id = ?1 AND file_id = ?2 AND active = 1"
+            ),
+            params![identity.volume.as_str(), identity.file.as_str()],
+            RawRoot::from_row,
+        )
+        .optional()
+        .map_err(|error| map_op_error(db_path, &error))?;
+    if let Some(raw) = same_file {
+        if raw
+            .canonical_path
+            .eq_ignore_ascii_case(identity.canonical.as_str())
+        {
+            tx.execute(
+                "UPDATE approved_roots SET last_validated_at = ?1 WHERE id = ?2",
+                params![max_timestamp(raw.last_validated_at, now.0), raw.id],
+            )
+            .map_err(|error| map_op_error(db_path, &error))?;
+            let mut record = raw.into_record()?;
+            record.last_validated_at = Timestamp(max_timestamp(record.last_validated_at.0, now.0));
+            return Ok(record);
+        }
+        return Err(StateError::ConflictingIdentity {
+            message: format!(
+                "the physical directory of {} is already approved as {}; one directory must not hold two authorities",
+                identity.canonical, raw.canonical_path
+            ),
+        });
+    }
+
+    let id = generate_id(tx, db_path)?;
+    tx.execute(
+        "INSERT INTO approved_roots
+         (id, canonical_path, volume_id, file_id, created_at, last_validated_at, active)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
+        params![
+            id,
+            identity.canonical.as_str(),
+            identity.volume.as_str(),
+            identity.file.as_str(),
+            now.0,
+        ],
+    )
+    .map_err(|error| map_op_error(db_path, &error))?;
+    Ok(ApprovedRootRecord {
+        id: ApprovedRootId(id),
+        canonical_path: identity.canonical.clone(),
+        volume_id: identity.volume.clone(),
+        file_id: identity.file.clone(),
+        created_at: now,
+        last_validated_at: now,
+        active: true,
+    })
+}
+
+fn upsert_workspace_tx(
+    tx: &Transaction<'_>,
+    db_path: &Path,
+    observation: &WorkspaceObservation,
+    now: Timestamp,
+) -> Result<(WorkspaceRecord, WorkspaceChangeKind), StateError> {
+    let identity = &observation.identity;
+    let root_exists: bool = tx
+        .query_row(
+            "SELECT count(*) FROM approved_roots WHERE id = ?1 AND active = 1",
+            params![observation.approved_root_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(|error| map_op_error(db_path, &error))?;
+    if !root_exists {
+        return Err(StateError::UnknownApprovedRoot {
+            id: observation.approved_root_id.clone(),
+        });
+    }
+
+    let exact = tx
+        .query_row(
+            &format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces
+                 WHERE volume_id = ?1 AND canonical_path = ?2
+                   AND status IN ('present', 'missing')"
+            ),
+            params![identity.volume.as_str(), identity.canonical.as_str()],
+            RawWorkspace::from_row,
+        )
+        .optional()
+        .map_err(|error| map_op_error(db_path, &error))?;
+    if let Some(raw) = exact {
+        if raw.file_id == identity.file.as_str() {
+            return update_observed(tx, db_path, raw, observation, now)
+                .map(|record| (record, WorkspaceChangeKind::Updated));
+        }
+        tx.execute(
+            "UPDATE workspaces SET status = 'replaced' WHERE id = ?1",
+            params![raw.id],
+        )
+        .map_err(|error| map_op_error(db_path, &error))?;
+        return insert_workspace(tx, db_path, observation, now)
+            .map(|record| (record, WorkspaceChangeKind::Registered));
+    }
+
+    let case_variant = tx
+        .query_row(
+            &format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces
+                 WHERE volume_id = ?1 AND file_id = ?2
+                   AND status IN ('present', 'missing')"
+            ),
+            params![identity.volume.as_str(), identity.file.as_str()],
+            RawWorkspace::from_row,
+        )
+        .optional()
+        .map_err(|error| map_op_error(db_path, &error))?;
+    if let Some(raw) = case_variant
+        && raw
+            .canonical_path
+            .eq_ignore_ascii_case(identity.canonical.as_str())
+    {
+        return update_observed(tx, db_path, raw, observation, now)
+            .map(|record| (record, WorkspaceChangeKind::Updated));
+    }
+
+    insert_workspace(tx, db_path, observation, now)
+        .map(|record| (record, WorkspaceChangeKind::Registered))
+}
+
 /// Updates an existing record for a repeated observation. `first_observed_at`
 /// is untouched, `last_observed_at` and `last_activity_at` never move
 /// backwards, and `protected`, `last_cleaned_at`, and `status` are preserved.
@@ -969,19 +1235,56 @@ fn update_observed(
     now: Timestamp,
 ) -> Result<WorkspaceRecord, StateError> {
     let last_observed_at = max_timestamp(raw.last_observed_at, now.0);
-    let last_activity_at = observation
+    let fingerprint_moved = fingerprint_changed(
+        raw.git_head_fingerprint.as_deref(),
+        observation.git_head_fingerprint.as_deref(),
+    ) || fingerprint_changed(
+        raw.git_index_fingerprint.as_deref(),
+        observation.git_index_fingerprint.as_deref(),
+    );
+    let evidence_activity = observation
         .activity_at
         .map(|activity| max_timestamp(raw.last_activity_at, activity.0))
         .unwrap_or(raw.last_activity_at);
+    let last_activity_at = if fingerprint_moved {
+        max_timestamp(evidence_activity, now.0)
+    } else {
+        evidence_activity
+    };
     tx.execute(
-        "UPDATE workspaces SET last_observed_at = ?1, last_activity_at = ?2 WHERE id = ?3",
-        params![last_observed_at, last_activity_at, raw.id],
+        "UPDATE workspaces
+         SET last_observed_at = ?1,
+             last_activity_at = ?2,
+             approved_root_id = ?3,
+             status = 'present',
+             git_state = ?4,
+             git_head_fingerprint = ?5,
+             git_index_fingerprint = ?6
+         WHERE id = ?7",
+        params![
+            last_observed_at,
+            last_activity_at,
+            observation.approved_root_id.as_str(),
+            observation.git_state.as_str(),
+            observation.git_head_fingerprint,
+            observation.git_index_fingerprint,
+            raw.id,
+        ],
     )
     .map_err(|error| map_op_error(db_path, &error))?;
     let mut record = raw.into_record(db_path)?;
     record.last_observed_at = Timestamp(last_observed_at);
     record.last_activity_at = Timestamp(last_activity_at);
+    record.approved_root_id = observation.approved_root_id.clone();
+    record.status = WorkspaceStatus::Present;
+    record.git_state = observation.git_state;
+    record.git_head_fingerprint = observation.git_head_fingerprint.clone();
+    record.git_index_fingerprint = observation.git_index_fingerprint.clone();
     Ok(record)
+}
+
+fn fingerprint_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if previous != current)
 }
 
 fn insert_workspace(
@@ -997,8 +1300,9 @@ fn insert_workspace(
         "INSERT INTO workspaces
          (id, canonical_path, approved_root_id, volume_id, file_id,
           first_observed_at, last_observed_at, last_activity_at,
-          last_cleaned_at, protected, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, NULL, 0, 'present')",
+          last_cleaned_at, protected, status, git_state,
+          git_head_fingerprint, git_index_fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, NULL, 0, 'present', ?8, ?9, ?10)",
         params![
             id,
             identity.canonical.as_str(),
@@ -1007,6 +1311,9 @@ fn insert_workspace(
             identity.file.as_str(),
             now.0,
             last_activity_at,
+            observation.git_state.as_str(),
+            observation.git_head_fingerprint,
+            observation.git_index_fingerprint,
         ],
     )
     .map_err(|error| map_op_error(db_path, &error))?;
@@ -1022,6 +1329,9 @@ fn insert_workspace(
         last_cleaned_at: None,
         protected: false,
         status: WorkspaceStatus::Present,
+        git_state: observation.git_state,
+        git_head_fingerprint: observation.git_head_fingerprint.clone(),
+        git_index_fingerprint: observation.git_index_fingerprint.clone(),
     })
 }
 
@@ -1104,6 +1414,9 @@ mod tests {
             identity: identity(path, volume, file),
             approved_root_id: root.clone(),
             activity_at: activity.map(Timestamp::from_unix_millis),
+            git_state: GitState::Unknown,
+            git_head_fingerprint: None,
+            git_index_fingerprint: None,
         })
     }
 
@@ -1242,6 +1555,40 @@ mod tests {
         assert!(ws.protected);
     }
 
+    #[test]
+    fn v1_to_v2_migration_preserves_protection_and_adds_unknown_git_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            apply_migrations(&mut conn, 0, &MIGRATIONS[..1]).unwrap();
+            conn.execute(
+                "INSERT INTO approved_roots
+                 (id, canonical_path, volume_id, file_id, created_at, last_validated_at, active)
+                 VALUES ('root', ?1, 'vol-1', 'file-1', 1, 1, 1)",
+                params![ROOT_A],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspaces
+                 (id, canonical_path, approved_root_id, volume_id, file_id,
+                  first_observed_at, last_observed_at, last_activity_at,
+                  last_cleaned_at, protected, status)
+                 VALUES ('workspace', ?1, 'root', 'vol-1', 'file-2',
+                         1, 2, 2, NULL, 1, 'present')",
+                params![WS_A],
+            )
+            .unwrap();
+        }
+        let store = open_at(&db, &FixedClock::new(3));
+        assert_eq!(store.schema_version().unwrap(), 2);
+        let workspaces = store.list_workspaces().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert!(workspaces[0].protected);
+        assert_eq!(workspaces[0].git_state, GitState::Unknown);
+        assert_eq!(workspaces[0].status, WorkspaceStatus::Present);
+    }
+
     // ---- identity behaviour --------------------------------------------
 
     #[test]
@@ -1374,6 +1721,135 @@ mod tests {
         let updated = observe(&mut store, &root.id, WS_A, "vol-1", "file-2", Some(1_500)).unwrap();
         assert!(updated.protected, "observation must not clear protection");
         assert!(store.get_workspace(&ws.id).unwrap().unwrap().protected);
+    }
+
+    #[test]
+    fn coordinated_config_failure_rolls_back_all_root_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = FixedClock::new(1_000);
+        let mut store = open_at(&temp_db(&dir), &clock);
+        let identities = vec![
+            identity(ROOT_A, "vol-1", "file-1"),
+            identity(WS_A, "vol-1", "file-2"),
+        ];
+        let result = store.register_approved_roots_coordinated(
+            &identities,
+            |_| Err::<(), _>("injected config failure"),
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(CoordinatedWriteError::External(_))));
+        assert!(store.list_approved_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_marks_missing_without_erasing_protection_and_restores_on_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = FixedClock::new(1_000);
+        let mut store = open_at(&temp_db(&dir), &clock);
+        let root = add_root(&mut store, ROOT_A, "vol-1", "file-1");
+        let observation = WorkspaceObservation {
+            identity: identity(WS_A, "vol-1", "file-2"),
+            approved_root_id: root.id.clone(),
+            activity_at: Some(Timestamp::from_unix_millis(900)),
+            git_state: GitState::Unknown,
+            git_head_fingerprint: Some("head-a".to_owned()),
+            git_index_fingerprint: Some("index-a".to_owned()),
+        };
+        let first = store
+            .apply_scan(
+                &[ValidatedRoot {
+                    id: root.id.clone(),
+                    identity: identity(ROOT_A, "vol-1", "file-1"),
+                }],
+                std::slice::from_ref(&observation),
+                &[],
+            )
+            .unwrap();
+        let workspace = &first.changes[0].workspace;
+        store.set_protected(&workspace.id, true).unwrap();
+
+        let uncertain = store
+            .apply_scan(
+                &[ValidatedRoot {
+                    id: root.id.clone(),
+                    identity: identity(ROOT_A, "vol-1", "file-1"),
+                }],
+                &[],
+                &[PathBuf::from(WS_A)],
+            )
+            .unwrap();
+        assert!(uncertain.missing.is_empty());
+        assert_eq!(
+            store.get_workspace(&workspace.id).unwrap().unwrap().status,
+            WorkspaceStatus::Present
+        );
+
+        clock.set(2_000);
+        let missing = store
+            .apply_scan(
+                &[ValidatedRoot {
+                    id: root.id.clone(),
+                    identity: identity(ROOT_A, "vol-1", "file-1"),
+                }],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(missing.missing.len(), 1);
+        assert_eq!(missing.missing[0].status, WorkspaceStatus::Missing);
+        assert!(missing.missing[0].protected);
+
+        clock.set(3_000);
+        let restored = store
+            .apply_scan(
+                &[ValidatedRoot {
+                    id: root.id,
+                    identity: identity(ROOT_A, "vol-1", "file-1"),
+                }],
+                &[observation],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(restored.changes[0].kind, WorkspaceChangeKind::Updated);
+        assert_eq!(
+            restored.changes[0].workspace.status,
+            WorkspaceStatus::Present
+        );
+        assert!(restored.changes[0].workspace.protected);
+    }
+
+    #[test]
+    fn git_fingerprint_movement_advances_activity_but_never_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = FixedClock::new(5_000);
+        let mut store = open_at(&temp_db(&dir), &clock);
+        let root = add_root(&mut store, ROOT_A, "vol-1", "file-1");
+        let first = store
+            .upsert_workspace_observation(WorkspaceObservation {
+                identity: identity(WS_A, "vol-1", "file-2"),
+                approved_root_id: root.id.clone(),
+                activity_at: Some(Timestamp::from_unix_millis(4_000)),
+                git_state: GitState::Unknown,
+                git_head_fingerprint: Some("head-a".to_owned()),
+                git_index_fingerprint: Some("index-a".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(first.last_activity_at.as_unix_millis(), 4_000);
+
+        clock.set(8_000);
+        let changed = store
+            .upsert_workspace_observation(WorkspaceObservation {
+                identity: identity(WS_A, "vol-1", "file-2"),
+                approved_root_id: root.id,
+                activity_at: Some(Timestamp::from_unix_millis(3_000)),
+                git_state: GitState::Unknown,
+                git_head_fingerprint: Some("head-b".to_owned()),
+                git_index_fingerprint: Some("index-a".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(changed.first_observed_at, first.first_observed_at);
+        assert_eq!(changed.last_activity_at.as_unix_millis(), 8_000);
+        assert_eq!(changed.git_state, GitState::Unknown);
     }
 
     #[test]
