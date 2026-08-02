@@ -7,15 +7,20 @@ pub fn capacity_for(path: &Path) -> Result<DiskCapacity, DiskError> {
 }
 
 pub fn file_identity(path: &Path) -> Result<(String, String), std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
     };
 
-    // Rust's std adds FILE_FLAG_BACKUP_SEMANTICS on Windows, so directories
-    // can be opened for metadata queries without any manual CreateFileW call.
-    let file = std::fs::File::open(path)?;
+    // Directories cannot be opened with a plain File::open on Windows:
+    // CreateFileW requires FILE_FLAG_BACKUP_SEMANTICS for directory handles,
+    // and a zero access mode queries metadata without requesting data access.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: `file` owns a valid handle for the duration of the call and
     // `info` is a properly aligned, writable out-parameter.
