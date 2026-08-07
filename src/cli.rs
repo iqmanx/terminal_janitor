@@ -5,11 +5,12 @@ use serde::Serialize;
 
 use crate::config::{ConfigError, load_config_at};
 use crate::disk::DiskProvider;
+use crate::executor::RunReport;
 use crate::model::DiskError;
 use crate::status::{StorageStatus, render_human, render_json};
 use crate::workflows::{
-    InitOptions, InitReport, ProtectionListReport, ProtectionReport, ScanReport, WorkflowError,
-    initialise, list_protection, scan, set_protection,
+    HistoryReport, InitOptions, InitReport, ProtectionListReport, ProtectionReport, ScanReport,
+    WorkflowError, check, history, initialise, list_protection, scan, set_protection,
 };
 
 pub const EXIT_SUCCESS: u8 = 0;
@@ -63,6 +64,16 @@ pub enum Command {
     },
     /// Report storage pressure without scanning or cleanup
     Status,
+    /// Non-interactive threshold run; the scheduler entry point
+    Check,
+    /// Same authority as check, asked for by a person
+    Clean,
+    /// Show journalled runs, newest first
+    History {
+        /// Maximum runs to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +113,35 @@ pub fn execute_scan(
 ) -> CommandOutput {
     match scan(config_path, state_path, dry_run) {
         Ok(report) => render_serializable(json, &report, render_scan_human(&report)),
+        Err(error) => workflow_failure(json, &error),
+    }
+}
+
+/// Runs the threshold loop and exits with the result's own code, so a
+/// scheduler can distinguish a healthy machine from a shortfall or a failure.
+pub fn execute_check(
+    json: bool,
+    config_path: &Path,
+    state_path: &Path,
+    volume_path: &Path,
+    dry_run: bool,
+) -> CommandOutput {
+    match check(config_path, state_path, volume_path, dry_run) {
+        Ok(report) => {
+            let exit_code = report.result.exit_code();
+            let rendered = render_serializable(json, &report, render_check_human(&report));
+            CommandOutput {
+                exit_code,
+                ..rendered
+            }
+        }
+        Err(error) => workflow_failure(json, &error),
+    }
+}
+
+pub fn execute_history(json: bool, state_path: &Path, limit: usize) -> CommandOutput {
+    match history(state_path, limit) {
+        Ok(report) => render_serializable(json, &report, render_history_human(&report)),
         Err(error) => workflow_failure(json, &error),
     }
 }
@@ -391,6 +431,81 @@ fn render_scan_human(report: &ScanReport) -> String {
     output
 }
 
+fn render_check_human(report: &RunReport) -> String {
+    let mut output = format!("Threshold run\nResult: {}\n", report.result);
+    match (report.free_before_bytes, report.free_after_bytes) {
+        (Some(before), Some(after)) => {
+            output.push_str(&format!(
+                "Free before: {before} bytes\nFree after:  {after} bytes\n"
+            ));
+            // Only a measured change is ever called recovery.
+            if let Some(recovered) = report.measured_recovery_bytes() {
+                output.push_str(&format!("Measured recovery: {recovered} bytes\n"));
+            }
+        }
+        _ => output.push_str("Free space was not measured.\n"),
+    }
+    output.push_str(&format!(
+        "Minimum free: {} bytes\nTarget free:  {} bytes\n",
+        report.minimum_free_bytes, report.target_free_bytes
+    ));
+    if let Some(detail) = &report.detail {
+        output.push_str(&format!("{detail}\n"));
+    }
+    if report.actions.is_empty() {
+        output.push_str("\nNothing was touched.\n");
+        return output;
+    }
+    output.push_str("\nActions\n");
+    for action in &report.actions {
+        let target = action
+            .path
+            .as_ref()
+            .map_or_else(String::new, |path| format!(" {}", path.display()));
+        output.push_str(&format!("{} {}{target}\n", action.state, action.action));
+        if let Some(detail) = &action.detail {
+            output.push_str(&format!("  {detail}\n"));
+        }
+    }
+    output
+}
+
+fn render_history_human(report: &HistoryReport) -> String {
+    if report.runs.is_empty() {
+        return "No runs have been journalled.\n".to_owned();
+    }
+    let mut output = String::new();
+    for run in &report.runs {
+        let result = run
+            .result
+            .map_or_else(|| "INTERRUPTED".to_owned(), |result| result.to_string());
+        output.push_str(&format!(
+            "{}\nResult: {result}\nVolume: {}\nFree before: {} bytes\n",
+            run.run_id, run.volume_id, run.free_before_bytes
+        ));
+        if let Some(after) = run.free_after_bytes {
+            output.push_str(&format!("Free after:  {after} bytes\n"));
+        }
+        for action in &run.actions {
+            output.push_str(&format!("  {} {}\n", action.state, action.action));
+            if let Some(recovery) = &action.recovery {
+                output.push_str(&format!("    recovery: {recovery}\n"));
+            }
+        }
+        // An interrupted run must never read as either success or failure.
+        let unresolved = run.unresolved_actions();
+        if !unresolved.is_empty() {
+            output.push_str(&format!(
+                "  {} action(s) were interrupted; their outcome is unknown and \
+                 they were not replayed.\n",
+                unresolved.len()
+            ));
+        }
+        output.push('\n');
+    }
+    output
+}
+
 fn render_protection_human(report: &ProtectionReport) -> String {
     format!(
         "{}\nWorkspace: {}\nProtected: {}\n",
@@ -438,11 +553,17 @@ mod tests {
         let help = Cli::try_parse_from(["terminal_janitor", "--help"]).unwrap_err();
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         let help = help.to_string();
-        for command in ["init", "scan", "protect", "status"] {
-            assert!(help.contains(command));
+        for command in [
+            "init", "scan", "protect", "status", "check", "clean", "history",
+        ] {
+            assert!(help.contains(command), "{command} must be listed");
         }
-        for later in ["check", "clean", "history", "enable", "disable"] {
-            assert!(!help.contains(&format!("\n  {later}")));
+        // Scheduling is Day 5; it must not be advertised before it exists.
+        for later in ["enable", "disable"] {
+            assert!(
+                !help.contains(&format!("\n  {later}")),
+                "{later} must not be listed yet"
+            );
         }
 
         let version = Cli::try_parse_from(["terminal_janitor", "--version"]).unwrap_err();

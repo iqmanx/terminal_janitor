@@ -5,6 +5,7 @@
 //! action or an argument array of its own: both are fixed at compile time.
 
 pub mod git;
+pub mod own_state;
 pub mod pnpm;
 
 use std::ffi::OsStr;

@@ -21,12 +21,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::identity::{CanonicalPath, FileId, IdentityError, PathIdentity, VolumeId};
+use crate::journal::{
+    ActionId, ActionOutcome, ActionRecord, ActionState, MAX_DETAILED_RUNS, NewAction, NewRun,
+    RunId, RunRecord, RunResult,
+};
 
 /// Normal maximum ledger size (SAFETY.md section 12).
 pub const MAX_STATE_DB_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Current schema version; equals the number of entries in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Ordered, explicit migrations. Each entry upgrades the schema by exactly
 /// one version and runs inside one transaction together with the version
@@ -112,6 +116,45 @@ const MIGRATIONS: &[&str] = &[
         version TEXT NOT NULL,
         enrolled_at INTEGER NOT NULL
     ) STRICT;",
+    // v4: the run and action journal. An action row exists before the action
+    // is attempted, so an interruption leaves a readable record rather than an
+    // absent one. `result` and `finished_at` stay NULL until a run completes,
+    // which is exactly how an interrupted run is recognised.
+    "CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        volume_id TEXT NOT NULL,
+        result TEXT,
+        free_before_bytes INTEGER NOT NULL,
+        free_after_bytes INTEGER,
+        minimum_free_bytes INTEGER NOT NULL,
+        target_free_bytes INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+    ) STRICT;
+    CREATE INDEX runs_by_start ON runs (started_at DESC, id);
+    CREATE TABLE run_actions (
+        id INTEGER PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        workspace_id TEXT,
+        canonical_path TEXT,
+        state TEXT NOT NULL CHECK (state IN (
+            'PLANNED', 'VALIDATING', 'RUNNING', 'SUCCEEDED', 'FAILED',
+            'SKIPPED_CHANGED', 'SKIPPED_ACTIVE', 'SKIPPED_PROTECTED',
+            'SKIPPED_UNKNOWN'
+        )),
+        free_before_bytes INTEGER NOT NULL,
+        free_after_bytes INTEGER,
+        actual_bytes INTEGER,
+        detail TEXT,
+        recovery TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+    ) STRICT;
+    CREATE UNIQUE INDEX run_actions_by_sequence ON run_actions (run_id, sequence);",
 ];
 
 /// Milliseconds since the Unix epoch.
@@ -473,6 +516,31 @@ pub trait StateStore {
     /// singular: exactly one executable may ever hold cleanup authority.
     fn set_pnpm_enrolment(&mut self, enrolment: &PnpmEnrolmentRecord) -> Result<(), StateError>;
     fn get_pnpm_enrolment(&self) -> Result<Option<PnpmEnrolmentRecord>, StateError>;
+
+    /// Opens a run in the journal. Called before any action is attempted.
+    fn begin_run(&mut self, run: &NewRun) -> Result<(), StateError>;
+    /// Writes one action down before it is attempted, in state `PLANNED`.
+    fn record_planned_action(&mut self, action: &NewAction) -> Result<ActionId, StateError>;
+    /// Moves an action to a non-terminal state as execution proceeds.
+    fn advance_action(&mut self, id: ActionId, state: ActionState) -> Result<(), StateError>;
+    /// Closes an action with its outcome and measured figures.
+    fn finish_action(&mut self, id: ActionId, outcome: &ActionOutcome) -> Result<(), StateError>;
+    /// Closes a run. Until this is called the run reads as interrupted.
+    fn finish_run(
+        &mut self,
+        run_id: &RunId,
+        result: RunResult,
+        free_after_bytes: Option<u64>,
+        finished_at: Timestamp,
+    ) -> Result<(), StateError>;
+    /// Most recent runs first, newest `limit` runs, each with its actions.
+    fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError>;
+    /// Marks the workspace as cleaned so its cooldown starts.
+    fn record_workspace_cleaned(
+        &mut self,
+        id: &WorkspaceId,
+        cleaned_at: Timestamp,
+    ) -> Result<(), StateError>;
 }
 
 /// Bundled-SQLite implementation of [`StateStore`].
@@ -1163,6 +1231,313 @@ impl StateStore for SqliteStateStore {
             enrolled_at: Timestamp(enrolled_at),
         }))
     }
+
+    fn begin_run(&mut self, run: &NewRun) -> Result<(), StateError> {
+        let db_path = self.db_path.clone();
+        let run = run.clone();
+        self.mutate(|tx, _now| {
+            tx.execute(
+                "INSERT INTO runs
+                    (id, plan_id, policy_hash, volume_id, result,
+                     free_before_bytes, free_after_bytes,
+                     minimum_free_bytes, target_free_bytes,
+                     started_at, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, NULL)",
+                params![
+                    run.run_id.as_str(),
+                    run.plan_id,
+                    run.policy_hash,
+                    run.volume_id,
+                    bytes_to_i64(run.free_before_bytes),
+                    bytes_to_i64(run.minimum_free_bytes),
+                    bytes_to_i64(run.target_free_bytes),
+                    run.started_at.0,
+                ],
+            )
+            .map_err(|error| map_op_error(&db_path, &error))?;
+            prune_runs_tx(tx, &db_path)
+        })
+    }
+
+    fn record_planned_action(&mut self, action: &NewAction) -> Result<ActionId, StateError> {
+        let db_path = self.db_path.clone();
+        let action = action.clone();
+        self.mutate(|tx, _now| {
+            tx.execute(
+                "INSERT INTO run_actions
+                    (run_id, sequence, action, workspace_id, canonical_path, state,
+                     free_before_bytes, free_after_bytes, actual_bytes,
+                     detail, recovery, started_at, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'PLANNED', ?6, NULL, NULL,
+                         NULL, NULL, ?7, NULL)",
+                params![
+                    action.run_id.as_str(),
+                    action.sequence,
+                    action.action,
+                    action.workspace_id,
+                    action
+                        .canonical_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    bytes_to_i64(action.free_before_bytes),
+                    action.started_at.0,
+                ],
+            )
+            .map_err(|error| map_op_error(&db_path, &error))?;
+            Ok(ActionId::new(tx.last_insert_rowid()))
+        })
+    }
+
+    fn advance_action(&mut self, id: ActionId, state: ActionState) -> Result<(), StateError> {
+        let db_path = self.db_path.clone();
+        self.mutate(|tx, _now| {
+            let updated = tx
+                .execute(
+                    "UPDATE run_actions SET state = ?1 WHERE id = ?2",
+                    params![state.as_str(), id.as_i64()],
+                )
+                .map_err(|error| map_op_error(&db_path, &error))?;
+            if updated == 0 {
+                return Err(StateError::Corrupt {
+                    path: db_path.clone(),
+                    message: format!("journalled action {} disappeared", id.as_i64()),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn finish_action(&mut self, id: ActionId, outcome: &ActionOutcome) -> Result<(), StateError> {
+        let db_path = self.db_path.clone();
+        let outcome = outcome.clone();
+        self.mutate(|tx, _now| {
+            let updated = tx
+                .execute(
+                    "UPDATE run_actions
+                     SET state = ?1, free_after_bytes = ?2, actual_bytes = ?3,
+                         detail = ?4, recovery = ?5, finished_at = ?6
+                     WHERE id = ?7",
+                    params![
+                        outcome.state.as_str(),
+                        outcome.free_after_bytes.map(bytes_to_i64),
+                        outcome.actual_bytes.map(bytes_to_i64),
+                        outcome.detail,
+                        outcome.recovery,
+                        outcome.finished_at.0,
+                        id.as_i64(),
+                    ],
+                )
+                .map_err(|error| map_op_error(&db_path, &error))?;
+            if updated == 0 {
+                return Err(StateError::Corrupt {
+                    path: db_path.clone(),
+                    message: format!("journalled action {} disappeared", id.as_i64()),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn finish_run(
+        &mut self,
+        run_id: &RunId,
+        result: RunResult,
+        free_after_bytes: Option<u64>,
+        finished_at: Timestamp,
+    ) -> Result<(), StateError> {
+        let db_path = self.db_path.clone();
+        let run_id = run_id.clone();
+        self.mutate(|tx, _now| {
+            tx.execute(
+                "UPDATE runs SET result = ?1, free_after_bytes = ?2, finished_at = ?3
+                 WHERE id = ?4",
+                params![
+                    result.as_str(),
+                    free_after_bytes.map(bytes_to_i64),
+                    finished_at.0,
+                    run_id.as_str(),
+                ],
+            )
+            .map_err(|error| map_op_error(&db_path, &error))?;
+            Ok(())
+        })
+    }
+
+    fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, plan_id, policy_hash, volume_id, result,
+                        free_before_bytes, free_after_bytes,
+                        minimum_free_bytes, target_free_bytes,
+                        started_at, finished_at
+                 FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1",
+            )
+            .map_err(|error| self.op_error(&error))?;
+        let raw_runs = statement
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .map_err(|error| self.op_error(&error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| self.op_error(&error))?;
+
+        let mut runs = Vec::with_capacity(raw_runs.len());
+        for raw in raw_runs {
+            let (
+                run_id,
+                plan_id,
+                policy_hash,
+                volume_id,
+                result,
+                free_before,
+                free_after,
+                minimum_free,
+                target_free,
+                started_at,
+                finished_at,
+            ) = raw;
+            // An unreadable result is corruption. Reporting it as an
+            // interrupted run would quietly turn a damaged ledger into a
+            // plausible history.
+            let result = match result {
+                Some(text) => Some(RunResult::parse(&text).ok_or_else(|| StateError::Corrupt {
+                    path: self.db_path.clone(),
+                    message: format!("run {run_id} holds unknown result {text}"),
+                })?),
+                None => None,
+            };
+            runs.push(RunRecord {
+                actions: self.actions_for_run(&run_id)?,
+                run_id,
+                plan_id,
+                policy_hash,
+                volume_id,
+                result,
+                free_before_bytes: i64_to_bytes(free_before),
+                free_after_bytes: free_after.map(i64_to_bytes),
+                minimum_free_bytes: i64_to_bytes(minimum_free),
+                target_free_bytes: i64_to_bytes(target_free),
+                started_at_millis: started_at,
+                finished_at_millis: finished_at,
+            });
+        }
+        Ok(runs)
+    }
+
+    fn record_workspace_cleaned(
+        &mut self,
+        id: &WorkspaceId,
+        cleaned_at: Timestamp,
+    ) -> Result<(), StateError> {
+        let db_path = self.db_path.clone();
+        let id = id.clone();
+        self.mutate(|tx, _now| {
+            let updated = tx
+                .execute(
+                    "UPDATE workspaces SET last_cleaned_at = ?1 WHERE id = ?2",
+                    params![cleaned_at.0, id.as_str()],
+                )
+                .map_err(|error| map_op_error(&db_path, &error))?;
+            if updated == 0 {
+                return Err(StateError::UnknownWorkspace { id: id.clone() });
+            }
+            Ok(())
+        })
+    }
+}
+
+impl SqliteStateStore {
+    fn actions_for_run(&self, run_id: &str) -> Result<Vec<ActionRecord>, StateError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT sequence, action, workspace_id, canonical_path, state,
+                        free_before_bytes, free_after_bytes, actual_bytes,
+                        detail, recovery, started_at, finished_at
+                 FROM run_actions WHERE run_id = ?1 ORDER BY sequence",
+            )
+            .map_err(|error| self.op_error(&error))?;
+        let raw_actions = statement
+            .query_map(params![run_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ))
+            })
+            .map_err(|error| self.op_error(&error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| self.op_error(&error))?;
+
+        raw_actions
+            .into_iter()
+            .map(|raw| {
+                let state = ActionState::parse(&raw.4).ok_or_else(|| StateError::Corrupt {
+                    path: self.db_path.clone(),
+                    message: format!("run {run_id} holds unknown action state {}", raw.4),
+                })?;
+                Ok(ActionRecord {
+                    sequence: raw.0,
+                    action: raw.1,
+                    workspace_id: raw.2,
+                    path: raw.3.map(PathBuf::from),
+                    state,
+                    free_before_bytes: i64_to_bytes(raw.5),
+                    free_after_bytes: raw.6.map(i64_to_bytes),
+                    actual_bytes: raw.7.map(i64_to_bytes),
+                    detail: raw.8,
+                    recovery: raw.9,
+                    started_at_millis: raw.10,
+                    finished_at_millis: raw.11,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Keeps detailed history within its documented bound (`SAFETY.md` section 12).
+/// Actions vanish with their run through the cascade.
+fn prune_runs_tx(tx: &Transaction<'_>, db_path: &Path) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM runs WHERE id NOT IN (
+             SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1
+         )",
+        params![i64::try_from(MAX_DETAILED_RUNS).unwrap_or(i64::MAX)],
+    )
+    .map_err(|error| map_op_error(db_path, &error))?;
+    Ok(())
+}
+
+/// SQLite integers are signed. Byte counts are stored saturated rather than
+/// wrapped, so a preposterous value can never read back as negative free space.
+fn bytes_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn i64_to_bytes(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 fn add_root_tx(

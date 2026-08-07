@@ -35,15 +35,24 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
-fn help_lists_only_day_two_commands() {
+fn help_lists_the_implemented_commands_and_no_later_ones() {
     let output = run(&["--help"]);
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    for implemented in ["init", "scan", "protect", "status"] {
-        assert!(stdout.contains(&format!("  {implemented}")));
+    for implemented in [
+        "init", "scan", "protect", "status", "check", "clean", "history",
+    ] {
+        assert!(
+            stdout.contains(&format!("  {implemented}")),
+            "{implemented} must be listed"
+        );
     }
-    for later_command in ["check", "clean", "history", "enable", "disable"] {
-        assert!(!stdout.contains(&format!("  {later_command}")));
+    // Scheduling is Day 5 and must not appear before it exists.
+    for later_command in ["enable", "disable"] {
+        assert!(
+            !stdout.contains(&format!("  {later_command}")),
+            "{later_command} must not be listed yet"
+        );
     }
 }
 
@@ -127,6 +136,144 @@ fn invalid_existing_platform_config_exits_nonzero_and_fails_closed() {
     assert!(output.stderr.is_empty());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["result"], "FAILED_CONFIGURATION");
+}
+
+/// The Day 4 gate, driven through the real binary: a volume declared to be
+/// under pressure runs only proven actions, touches no project, records a
+/// complete journal, and reports a safe shortfall rather than reaching further.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pressured_run_executes_only_proven_actions_and_journals_them() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("projects");
+    let workspace = root.join("api");
+    std::fs::create_dir_all(&workspace).unwrap();
+    for marker in ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"] {
+        std::fs::write(workspace.join(marker), b"fixture").unwrap();
+    }
+    let lockfile = workspace.join("pnpm-lock.yaml");
+    let lockfile_before = std::fs::read(&lockfile).unwrap();
+
+    let fake_bin = home.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let invocations = home.path().join("invocations.log");
+    use std::os::unix::fs::PermissionsExt;
+    for executable in ["pnpm", "git", "sh", "bash", "npm", "node"] {
+        let path = fake_bin.join(executable);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '{executable} %s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = \"--version\" ]; then echo 11.2.3; fi\n",
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // A threshold no real machine can satisfy, so the run is genuinely under
+    // pressure without anyone having to fill a disk.
+    let init = command(home.path())
+        .args([
+            "init",
+            "--root",
+            root.to_str().unwrap(),
+            "--pnpm",
+            fake_bin.join("pnpm").to_str().unwrap(),
+            "--minimum-free",
+            "900000GiB",
+            "--target-free",
+            "950000GiB",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&init);
+
+    let scan = command(home.path())
+        .env("PATH", &fake_bin)
+        .args(["scan", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&scan);
+
+    let check = command(home.path())
+        .env("PATH", &fake_bin)
+        .args(["check", "--json"])
+        .output()
+        .unwrap();
+    let check_json: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+
+    // Every safe action was used and the target is still unreachable, which is
+    // a correct outcome, not a failure to try harder.
+    assert_eq!(check_json["result"], "SHORTFALL_SAFE_ACTIONS_EXHAUSTED");
+    assert_eq!(check.status.code(), Some(1));
+
+    // The workspace was observed moments ago, so it can never be cleaned here.
+    let actions = check_json["actions"].as_array().unwrap();
+    assert!(
+        actions
+            .iter()
+            .all(|action| action["action"] != "PNPM_WORKSPACE_CLEAN"),
+        "a newly observed workspace must not be cleaned: {actions:?}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action["action"] == "CLEAN_TERMINAL_JANITOR_STATE"),
+        "own-state cleanup must run"
+    );
+
+    let log = std::fs::read_to_string(&invocations).unwrap_or_default();
+    for line in log.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            matches!(tokens.first(), Some(&"pnpm") | Some(&"git")),
+            "unexpected external program: {line:?}"
+        );
+        for token in &tokens[1..] {
+            assert!(
+                !matches!(*token, "clean" | "--lockfile" | "-l" | "--force"),
+                "{token:?} must never be passed; invocation was {line:?}"
+            );
+        }
+    }
+    assert!(
+        log.contains("pnpm store prune"),
+        "the delegated store prune must run; log was {log:?}"
+    );
+    assert_eq!(
+        std::fs::read(&lockfile).unwrap(),
+        lockfile_before,
+        "the lockfile is the recovery proof and must survive"
+    );
+
+    // The journal must hold a complete, finished record of what happened.
+    let history = command(home.path())
+        .args(["history", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&history);
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history_json["result"], "HISTORY");
+    let runs = history_json["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run["result"], "SHORTFALL_SAFE_ACTIONS_EXHAUSTED");
+    assert!(
+        run["finished_at_millis"].is_number(),
+        "the run must be closed"
+    );
+    let journalled = run["actions"].as_array().unwrap();
+    assert_eq!(journalled.len(), actions.len());
+    for action in journalled {
+        let state = action["state"].as_str().unwrap();
+        assert!(
+            state != "PLANNED" && state != "VALIDATING" && state != "RUNNING",
+            "no action may be left in flight: {action:?}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

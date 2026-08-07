@@ -7,8 +7,9 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Days 1, 2A, 2B, and 3 complete; the Day 2 and Day 3 gates
-                both passed on Ubuntu, macOS, and Windows; Day 4 not started
+Current phase:  Days 1 through 3 complete with their gates passed on Ubuntu,
+                macOS, and Windows; Day 4 implemented locally, its gate
+                pending cross-platform CI
 ```
 
 ## Governing state
@@ -968,9 +969,139 @@ Known limitations:
 
 Blockers: none.
 
-Exact next action: begin **Day 4 — Verified Executor and Threshold Loop**.
+Exact next action: close the Day 4 gate with cross-platform CI, then begin
+**Day 5 — Activity Protection and Native Scheduling**.
 
-### Days 4–7
+### Day 4 — Verified executor and threshold loop
+
+Status: **implementation complete locally; Day 4 gate pending cross-platform CI**
+
+Date: 2026-08-07
+
+Files changed:
+
+```text
+src/journal.rs            (new)
+src/executor.rs           (new)
+src/adapters/own_state.rs (new)
+src/adapters/mod.rs
+src/planner.rs
+src/state.rs
+src/workflows.rs
+src/cli.rs
+src/main.rs
+src/lib.rs
+tests/cli_tests.rs
+README.md
+IMPLEMENTATION_STATUS.md
+```
+
+Dependencies added and why:
+
+- None. File locking uses the standard library's own `File::try_lock`, which
+  has been stable since Rust 1.89 and whose inherent methods now shadow the
+  `fs4` trait. `fs4` remains only for capacity measurement.
+
+Delivered:
+
+- schema v4 journal: a `runs` row and a `run_actions` row per action, written
+  before anything is attempted, with the nine `SAFETY.md` action states, free
+  space before and after, measured recovery, a recovery instruction, and a
+  cascade so pruning a run takes its actions with it;
+- a 200-run cap enforced on every run insert;
+- run results covering the whole `ACCEPTANCE.md` section N vocabulary, each
+  with a process exit code, so a scheduler can tell a healthy machine from a
+  shortfall from a failure;
+- an exclusive per-volume advisory file lock; a second run returns
+  `ALREADY_RUNNING` without measuring further, executing, or journalling;
+- the threshold loop in the order `PLANS.md` fixes: measure, exit above
+  `minimum_free` without scanning or locking, lock, remeasure, execute one
+  action at a time, measure after each, stop at `target_free`;
+- pre-action revalidation running every planning gate again, with each refusal
+  mapped to exactly one of `SKIPPED_CHANGED`, `SKIPPED_ACTIVE`,
+  `SKIPPED_PROTECTED`, or `SKIPPED_UNKNOWN`;
+- plan expiry enforced per action, so a run that outlives its plan stops rather
+  than acting on stale measurements;
+- direct execution with the compiled argument arrays, the enrolled executable
+  path, the exact verified workspace as working directory, a 15-minute timeout,
+  and bounded output; a non-zero exit, timeout, or truncation stops the run;
+- own-state cleanup that removes only this product's own lock files, only when
+  they are both old and unheld, and never a file the product did not create;
+- the one permitted post-workspace-clean store prune per run;
+- `last_cleaned_at` written on success, so the workspace cooldown starts;
+- `check`, `clean`, and `history` commands, with `clean` sharing `check`'s
+  authority exactly and `history` reporting unresolved actions as unresolved.
+
+Design decisions worth carrying forward:
+
+- **A healthy machine leaves no journal.** Above `minimum_free` the run exits
+  before locking or journalling. An hourly scheduled run would otherwise fill
+  the 200-run history with no-ops and push out the records that matter.
+- **A shortfall exits non-zero.** `SHORTFALL_SAFE_ACTIONS_EXHAUSTED` is a
+  correct, safe outcome, but it is one the owner should be able to notice from
+  a scheduler, so it exits 1 while every `OK_` and `SKIPPED_` result exits 0.
+- **A failed command ends the run.** The loop does not continue to the next
+  action after a failure, because an ambiguous failure is exactly when
+  continuing would be least justified.
+- **Actions after the target are never journalled.** They were not begun, and
+  recording them as planned-but-untouched would blur what the run actually did.
+
+Commands run locally:
+
+```text
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
+
+- 187/187 tests pass, 0 failed, 0 ignored (180 unit + 7 actual-binary
+  integration tests), up from 159 at the close of Day 3;
+- journal tests cover every state and result round-tripping, exit codes, and an
+  interrupted run reporting its unresolved actions rather than a verdict;
+- own-state tests cover stable lock naming without punctuation, a fresh lock
+  surviving, an old unheld lock being removed, an old *held* lock surviving,
+  and a file the product did not create never being touched;
+- executor tests cover a healthy volume doing nothing at all, stop-at-target,
+  the exact executable/arguments/working directory with no shell and no
+  forbidden argument, the post-clean prune cap, a failing command stopping the
+  run, a timeout stopping the run, a second run refused with `ALREADY_RUNNING`,
+  a workspace that became active being skipped, a worktree that became dirty
+  being skipped, an expired plan executing nothing, a failed measurement
+  stopping before any action, the journal holding measured figures, the
+  cooldown being written, and a shortfall reaching no further than its plan;
+- the executor tests build their world through a real ledger — approved root,
+  workspace observations, and pnpm enrolment — rather than synthetic records,
+  so the cooldown write and identity revalidation exercise real rows;
+- the CLI integration test drives the real binary end to end: it declares a
+  threshold no machine can satisfy, runs `check`, and asserts the result is
+  `SHORTFALL_SAFE_ACTIONS_EXHAUSTED` with exit code 1, that no workspace clean
+  was attempted for a newly observed workspace, that own-state cleanup ran,
+  that only `pnpm --version`, `pnpm store prune`, and `git status` were ever
+  invoked, that no `clean`, `--lockfile`, `-l`, or `--force` argument appeared,
+  that the lockfile is byte-identical afterwards, and that `history` shows one
+  closed run with no action left in flight.
+
+Known limitations:
+
+- No workspace clean can occur on a real machine until Day 5 supplies process
+  liveness, so the executor's workspace path is proven by injected provers and
+  generated fixtures rather than by a live run.
+- macOS snapshot and purgeable capacity ambiguity is untouched.
+  `SKIPPED_SNAPSHOT_CAPACITY_UNCERTAIN` exists in the vocabulary and is tested
+  as a value, but nothing produces it yet; that is Day 5 scope.
+- The pnpm-store cooldown is pnpm's own. This product enforces only the
+  one-post-clean-prune-per-run cap.
+- Local evidence is Linux/aarch64.
+
+Blockers: none.
+
+Exact next action: require Ubuntu, macOS, and Windows CI to pass for the Day 4
+commit, record the run, then begin **Day 5 — Activity Protection and Native
+Scheduling**.
+
+### Days 5–7
 
 Status: **not started**
 
@@ -978,18 +1109,16 @@ Follow `PLANS.md` strictly. Do not begin a later day until the current day's man
 
 ## Current repository contents
 
-Days 1, 2A, 2B, and 3 contain the systems, configuration, status/CLI, identity,
+Days 1 through 4 contain the systems, configuration, status/CLI, identity,
 state ledger, registration, discovery, activity-observation, protection,
-pnpm/Git adapters, and proof-driven planning foundation. Still intentionally
-absent (Day 4 and later scope):
+pnpm/Git adapters, proof-driven planning, journalling, and the verified
+executor. Still intentionally absent (Day 5 and later scope):
 
 ```text
-src/executor.rs
-src/journal.rs
 scripts/
 ```
 
-Their absence is not a defect at this point in the plan. Present after Day 3:
+Their absence is not a defect at this point in the plan. Present after Day 4:
 
 ```text
 Cargo.toml
@@ -1008,9 +1137,12 @@ src/model.rs
 src/disk.rs
 src/planner.rs
 src/protection.rs
+src/executor.rs
+src/journal.rs
 src/adapters/mod.rs
 src/adapters/pnpm.rs
 src/adapters/git.rs
+src/adapters/own_state.rs
 src/platform/
 tests/cli_tests.rs
 .github/workflows/ci.yml
@@ -1021,12 +1153,12 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Begin **Day 4 — Verified Executor and Threshold Loop**: per-volume lock, run and action journal,
-   direct execution with exact argument arrays, command timeout and bounded
-   output, pre-action proof and identity revalidation, free-space measurement
-   before and after every action, stop-at-target, shortfall, the two-workspace
-   cap, own-state cleanup, and the pnpm-store cooldown with its one immediate
-   post-clean exception.
+2. Confirm the recorded Day 4 CI evidence, then begin **Day 5 — Activity
+   Protection and Native Scheduling**: process working-directory and command
+   detection, enumeration failure protecting the workspace, revalidation
+   immediately before cleanup, idempotent `enable`/`disable`, systemd user
+   timers, macOS LaunchAgents, Windows Task Scheduler, and the macOS snapshot
+   capacity rule.
 3. Do not weaken the Day 3 liveness gate to make an executor demonstration
    work. `UnavailableLivenessProver` must keep answering `Unknown` until Day 5
    supplies real process enumeration; a Day 4 demonstration uses an injected
@@ -1058,7 +1190,7 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Days 3–7 remain outstanding
+Reason: Days 5–7 remain outstanding and the Day 4 gate is not yet closed
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.

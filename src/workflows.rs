@@ -18,7 +18,12 @@ use crate::discovery::{
     DiscoveryProvider, ExcludedPath, ExclusionReason, SystemDiscoveryProvider, UnavailableRoot,
     discover,
 };
+use crate::disk::SystemDiskProvider;
+use crate::executor::{
+    ActionReport, ExecutionError, ExecutionInputs, ExecutionProviders, RunReport, execute,
+};
 use crate::identity::{CanonicalPath, PathIdentity, VolumeId};
+use crate::journal::{ActionState, RunRecord, RunResult};
 use crate::planner::{
     GitProver, Plan, PlanningInputs, PlanningProviders, UnavailableGitProver,
     UnavailableLivenessProver, plan,
@@ -621,6 +626,160 @@ fn build_plans(
             )
         })
         .collect())
+}
+
+/// Runs the threshold loop: measure, plan, and execute proven actions.
+///
+/// `check` and `clean` both land here with identical authority. `clean` exists
+/// so a person can ask for the same run a scheduler would perform; it unlocks
+/// nothing extra (`PLANS.md`, `ACCEPTANCE.md` section L).
+pub fn check(
+    config_path: &Path,
+    state_path: &Path,
+    volume_path: &Path,
+    dry_run: bool,
+) -> Result<RunReport, WorkflowError> {
+    let loaded = load_config_at(config_path)?;
+    if !state_path.is_file() {
+        return Err(WorkflowError::State(StateError::Unavailable {
+            path: state_path.to_path_buf(),
+            message: "state does not exist; run init first".to_owned(),
+        }));
+    }
+    let mut state = SqliteStateStore::open(state_path)?;
+    let workspaces = state.list_workspaces()?;
+    let roots = state.list_approved_roots()?;
+    let enrolment = state
+        .get_pnpm_enrolment()?
+        .as_ref()
+        .and_then(|record| PnpmEnrolment::from_record(record).ok());
+
+    let volume = PathIdentity::resolve(volume_path)
+        .map_err(|error| WorkflowError::RootValidation {
+            path: volume_path.to_path_buf(),
+            message: error.to_string(),
+        })?
+        .volume;
+
+    let runner = SystemCommandRunner;
+    let git_prover: Box<dyn GitProver> = match git::locate_on_path() {
+        Some(git) => Box::new(CommandGitProver {
+            git,
+            runner: &runner,
+        }),
+        None => Box::new(UnavailableGitProver),
+    };
+    let protection_probe = SystemProtectionProbe;
+    let denied_roots = DeniedRoots::from_user_directories();
+    let providers = PlanningProviders {
+        discovery: &SystemDiscoveryProvider,
+        protection_probe: &protection_probe,
+        denied_roots: &denied_roots,
+        liveness: &UnavailableLivenessProver,
+        git: git_prover.as_ref(),
+    };
+
+    let clock = SystemClock;
+    let built = plan(
+        &PlanningInputs {
+            workspaces: &workspaces,
+            approved_roots: &roots,
+            pnpm: enrolment.as_ref(),
+            pressured_volume: &volume,
+            config: &loaded.config,
+            now: clock.now(),
+        },
+        &providers,
+    );
+
+    let state_directory = state_path.parent().unwrap_or(state_path);
+    let inputs = ExecutionInputs {
+        plan: &built,
+        workspaces: &workspaces,
+        approved_roots: &roots,
+        config: &loaded.config,
+        volume_path,
+        pressured_volume: &volume,
+        pnpm: enrolment.as_ref(),
+        state_directory,
+    };
+
+    if dry_run {
+        // A dry run reports the plan it would have executed and stops before
+        // the lock, so it cannot block a real run either.
+        return Ok(dry_run_report(&inputs, &providers, &built));
+    }
+
+    execute(
+        &inputs,
+        &ExecutionProviders {
+            disk: &SystemDiskProvider,
+            runner: &runner,
+            clock: &clock,
+            planning: &providers,
+        },
+        &mut state,
+    )
+    .map_err(|error| match error {
+        ExecutionError::State(state) => WorkflowError::State(state),
+        ExecutionError::Lock { path, source } => WorkflowError::RootValidation {
+            path,
+            message: source.to_string(),
+        },
+    })
+}
+
+/// Describes what a run would attempt, without measuring, locking, or doing it.
+fn dry_run_report(
+    inputs: &ExecutionInputs<'_>,
+    _providers: &PlanningProviders<'_>,
+    built: &Plan,
+) -> RunReport {
+    RunReport {
+        result: RunResult::OkNoPressure,
+        run_id: None,
+        plan_id: built.plan_id.clone(),
+        free_before_bytes: None,
+        free_after_bytes: None,
+        minimum_free_bytes: inputs.config.minimum_free_bytes,
+        target_free_bytes: inputs.config.target_free_bytes,
+        actions: built
+            .actions
+            .iter()
+            .map(|action| ActionReport {
+                action: action.action.to_owned(),
+                workspace_id: action.workspace_id.clone(),
+                path: action.path.clone(),
+                state: ActionState::Planned,
+                free_before_bytes: 0,
+                free_after_bytes: None,
+                actual_bytes: None,
+                detail: None,
+            })
+            .collect(),
+        detail: Some("dry run: nothing was measured, locked, or executed".to_owned()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryReport {
+    pub result: &'static str,
+    pub runs: Vec<RunRecord>,
+}
+
+/// Reads the journal, newest run first.
+pub fn history(state_path: &Path, limit: usize) -> Result<HistoryReport, WorkflowError> {
+    if !state_path.is_file() {
+        return Err(WorkflowError::State(StateError::Unavailable {
+            path: state_path.to_path_buf(),
+            message: "state does not exist; run init first".to_owned(),
+        }));
+    }
+    let state = SqliteStateStore::open(state_path)?;
+    Ok(HistoryReport {
+        result: "HISTORY",
+        runs: state.list_runs(limit)?,
+    })
 }
 
 pub fn set_protection(

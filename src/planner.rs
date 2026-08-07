@@ -173,6 +173,35 @@ pub enum GateFailure {
 }
 
 impl GateFailure {
+    /// The journalled action state this refusal produces when it happens
+    /// during pre-execution revalidation rather than during planning.
+    ///
+    /// The three skip reasons stay distinct: "the target moved", "something is
+    /// using it", and "we refused" must never collapse into "we could not
+    /// tell", and anything genuinely unknown must never collapse into one of
+    /// the others.
+    pub fn skip_state(&self) -> crate::journal::ActionState {
+        use crate::journal::ActionState;
+        match self {
+            Self::Protected(_) => ActionState::SkippedProtected,
+            Self::WorkspaceActive => ActionState::SkippedActive,
+            Self::NotInsideApprovedRoot
+            | Self::WorkspaceNotPresent { .. }
+            | Self::TargetIdentityChanged { .. }
+            | Self::DifferentVolume
+            | Self::MissingMarker { .. }
+            | Self::PnpmIdentityChanged { .. }
+            | Self::PnpmBelowMinimumVersion { .. }
+            | Self::PnpmNotEnrolled
+            | Self::GitWorktreeDirty
+            | Self::ObservationWindowNotMet { .. }
+            | Self::RecentActivity { .. }
+            | Self::CooldownActive { .. }
+            | Self::AutomaticWorkspaceCapReached { .. } => ActionState::SkippedChanged,
+            Self::GitStateUnknown | Self::LivenessUnknown => ActionState::SkippedUnknown,
+        }
+    }
+
     /// Stable machine-readable gate name.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -469,6 +498,20 @@ fn store_prune_proof() -> ProofBundle {
         executable_identity_verified: true,
         target_identity_verified: true,
     }
+}
+
+/// Re-runs every gate for one workspace immediately before execution.
+///
+/// Planning proves a workspace was eligible when the plan was built; this
+/// proves it still is. Liveness and identity are the reasons this exists: both
+/// can change between planning and execution, and `SAFETY.md` section 8
+/// requires revalidation rather than trust.
+pub fn revalidate_workspace(
+    workspace: &WorkspaceRecord,
+    inputs: &PlanningInputs<'_>,
+    providers: &PlanningProviders<'_>,
+) -> Result<ProofBundle, GateFailure> {
+    evaluate_workspace(workspace, inputs, providers)
 }
 
 fn evaluate_workspace(

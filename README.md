@@ -59,7 +59,7 @@ README.md
 
 No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
 
-## Current CLI (Day 3)
+## Current CLI (Day 4)
 
 ```text
 terminal_janitor init --root <path> [--root <path> ...] [--pnpm <path>]
@@ -71,6 +71,9 @@ terminal_janitor protect remove <path>
 terminal_janitor protect list
 terminal_janitor status
 terminal_janitor status --json
+terminal_janitor check
+terminal_janitor clean
+terminal_janitor history [--limit <n>]
 ```
 
 `--json` and `--dry-run` are global. `--dry-run` reads and reports without
@@ -153,6 +156,37 @@ Add and remove are idempotent, and protection persists across scans, process
 restarts, and schema migration. `protect list --json`, `protect add ... --json`,
 and `protect remove ... --json` are also supported through the global JSON
 option.
+
+`check` is the non-interactive threshold run and the scheduler's entry point.
+`clean` is the same run asked for by a person: it shares every line of
+`check`'s authority and unlocks nothing extra. Both follow one fixed order —
+measure free space; exit above `minimum_free` without scanning, locking, or
+journalling; take an exclusive per-volume lock; remeasure under the lock;
+then execute proven actions one at a time, measuring the volume after each and
+stopping the moment `target_free` is reached.
+
+Before each action runs, every gate is asked again. Planning proved the
+workspace was eligible; revalidation proves it still is, because liveness,
+identity, protection, and Git state can all change in between. A refusal at
+that point is journalled as exactly one of `SKIPPED_CHANGED`,
+`SKIPPED_ACTIVE`, `SKIPPED_PROTECTED`, or `SKIPPED_UNKNOWN`. A non-zero exit,
+a timeout, or truncated output stops the whole run; it never escalates into a
+broader attempt.
+
+Only one run may operate on a volume at once. A second run returns
+`ALREADY_RUNNING` without measuring further or touching anything. The lock is
+an advisory file lock rather than a file's existence, so a killed process
+releases it and a leftover file blocks nothing.
+
+Every action is written to the journal before it is attempted and moved
+through explicit states as it proceeds, so an interrupted run stays readable:
+an action caught in `VALIDATING` or `RUNNING` is reported as unresolved, never
+as success, and is never replayed blindly. `history` shows journalled runs
+newest first, with free-space figures, per-action states, and the recovery
+instruction for anything removed. Detailed history is capped at 200 runs.
+
+Only measured free-space change is ever reported as recovery. Estimated bytes
+appear nowhere in a result.
 
 `status` measures the volume containing the current working directory. It reads
 at most one small configuration file, calculates `Healthy` or `Pressure`,
@@ -305,15 +339,19 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 
 ## Current state
 
-Days 1, 2A, and 2B are complete, and the complete Day 2 gate passed on Ubuntu,
-macOS, and Windows.
+Days 1 through 3 are complete, each closed by CI green on Ubuntu, macOS, and
+Windows.
 
-Day 3 adds pnpm enrolment, the typed action boundary, the proof bundle, the
-ownership, reference, protection, cloud-sync, Git-cleanliness, observation,
-inactivity, cooldown, and liveness gates, plan identity with expiry and a
-policy hash, plan explanations in `scan --json`, and `--dry-run`.
+Day 4 adds the verified executor: the per-volume lock, the run and action
+journal, direct execution with compiled argument arrays, pre-action proof and
+identity revalidation, measurement after every action, stop-at-target, the
+safe-shortfall result, the two-workspace cap, own-state cleanup, the one
+permitted post-clean store prune, and the `check`, `clean`, and `history`
+commands.
 
-Nothing executes cleanup yet. There is no executor, journal, per-volume lock,
-threshold loop, process enumeration, or scheduling; those are Days 4 and 5.
-See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact
-handover state.
+Cleanup can now run, but not on a real machine yet: process enumeration is Day
+5, so the production liveness prover answers `unknown` and no workspace clean
+is ever planned. A real `check` under pressure will run own-state cleanup and
+delegate a store prune, then report a shortfall. Scheduling does not exist;
+that is Day 5. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for
+the exact handover state.

@@ -3,8 +3,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use terminal_janitor::cli::{
-    Cli, Command, CommandOutput, configuration_path_failure, execute_init, execute_protection,
-    execute_scan, execute_status, render_failure, storage_path_failure,
+    Cli, Command, CommandOutput, configuration_path_failure, execute_check, execute_history,
+    execute_init, execute_protection, execute_scan, execute_status, render_failure,
+    storage_path_failure,
 };
 use terminal_janitor::config::config_file_path;
 use terminal_janitor::disk::SystemDiskProvider;
@@ -33,6 +34,9 @@ fn main() -> ExitCode {
         Command::Scan => run_scan(json, dry_run),
         Command::Protect { command } => run_protection(json, command),
         Command::Status => run_status(json),
+        // `clean` deliberately shares every line of `check`'s authority.
+        Command::Check | Command::Clean => run_check(json, dry_run),
+        Command::History { limit } => run_history(json, limit),
     };
     emit(output)
 }
@@ -59,6 +63,36 @@ fn run_scan(json: bool, dry_run: bool) -> CommandOutput {
         Err(error) => return render_failure(json, "FAILED_STATE", &error, 5),
     };
     execute_scan(json, &config_path, &state_path, dry_run)
+}
+
+fn run_check(json: bool, dry_run: bool) -> CommandOutput {
+    let config_path = match config_file_path() {
+        Ok(path) => path,
+        Err(error) => return configuration_path_failure(json, &error),
+    };
+    let state_path = match state_file_path() {
+        Ok(path) => path,
+        Err(error) => return render_failure(json, "FAILED_STATE", &error, 5),
+    };
+    let volume_path = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(source) => {
+            let error = DiskError::MeasurementFailed {
+                path: ".".into(),
+                source,
+            };
+            return storage_path_failure(json, &error);
+        }
+    };
+    execute_check(json, &config_path, &state_path, &volume_path, dry_run)
+}
+
+fn run_history(json: bool, limit: usize) -> CommandOutput {
+    let state_path = match state_file_path() {
+        Ok(path) => path,
+        Err(error) => return render_failure(json, "FAILED_STATE", &error, 5),
+    };
+    execute_history(json, &state_path, limit)
 }
 
 fn run_protection(json: bool, command: terminal_janitor::cli::ProtectCommand) -> CommandOutput {
