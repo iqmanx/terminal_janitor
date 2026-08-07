@@ -8,10 +8,12 @@ Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
 Current phase:  Days 1 through 4 complete, every gate passed on Ubuntu,
-                macOS, and Windows. Day 5 is implemented but its gate is
-                NOT met: it requires real-machine scheduler verification on
-                all three platforms, and macOS cannot clean a workspace at
-                all until snapshot-aware capacity measurement exists.
+                macOS, and Windows. Days 5 and 6 are implemented and neither
+                gate is met. Day 5 requires real-machine scheduler
+                verification on all three platforms, and macOS cannot clean a
+                workspace at all until snapshot-aware capacity measurement
+                exists. Day 6 requires three-platform CI, which has not run
+                for its commit; its local suite is green.
 ```
 
 ## Governing state
@@ -1251,7 +1253,157 @@ and the implementation below must not be read as evidence that it passed.
 Exact next action: obtain real-machine Day 5 evidence on Linux, macOS, and
 Windows, or record the owner's decision to accept the gap; then **Day 6**.
 
-### Days 6–7
+### Day 6 — Adversarial hardening
+
+Status: **implemented; the Day 6 gate is NOT yet claimable — it requires
+Ubuntu, macOS, and Windows CI, which has not run for this commit**
+
+Date: 2026-08-07
+
+Commit: recorded in the follow-up documentation commit, together with the CI
+run that either closes or reopens this gate.
+
+Files changed:
+
+```text
+src/config.rs
+src/identity.rs
+src/journal.rs
+src/executor.rs
+src/planner.rs
+tests/adversarial_tests.rs   (new)
+IMPLEMENTATION_STATUS.md
+```
+
+Dependencies added and why:
+
+- None. Day 6 adds no product behaviour and no dependency.
+
+Delivered (tests only — no production code changed):
+
+- a non-interference assertion through the real binary: a pressured run over a
+  generated fixture leaves every file outside the product's own state directory
+  byte-for-byte and timestamp-for-timestamp identical, and every project file
+  still present, which is also the direct proof that the Rust engine never
+  recursively deletes a project path;
+- proof that a project-defined `clean` script cannot run: the fixture's
+  `package.json` declares one that would leave evidence on disk, and the
+  evidence never appears — this is what `pnpm pm clean` rather than
+  `pnpm clean` buys;
+- filesystem hostility: a symlinked approved root refused outright, a symlink
+  loop inside an approved root traversed without hanging or duplicating a
+  registration, a dangling link and a tree 80 levels deep registering nothing
+  while a reachable workspace beside them still registers, case-variant
+  spellings never producing a second identity, and every alternative spelling
+  of one directory (`.`, `..`, a trailing separator) resolving to one identity;
+- a broken link refused with an explicit error rather than resolved to its own
+  path, which would hand out authority over a directory that is not there;
+- the Windows shape of the same case: a real directory reparse point is
+  asserted to be visible as a link, which is the property the final-component
+  refusal depends on, and to canonicalise to the target's single identity;
+- revalidation proven against replacement: a workspace whose directory is
+  swapped for a different physical directory between planning and execution is
+  journalled `SKIPPED_CHANGED` and never cleaned, so authority follows identity
+  and never the path spelling;
+- a volume that shrinks mid-run — another process filling the disk — reports
+  zero recovery rather than a wrapped subtraction, runs no action the plan did
+  not contain, and invokes only the two compiled argument arrays;
+- property tests over the size parser: 165 number/unit combinations must each
+  either parse to exactly the product they claim or be refused with a message
+  naming the field, and the u64 boundary is refused rather than wrapped into a
+  small, permissive threshold;
+- approved-root normalisation proven deterministic and total: the same roots in
+  any order produce one identical stored list, duplicates collapse, and a
+  relative root is refused rather than resolved;
+- all 256 combinations of the eight-field `ProofBundle`: exactly one is
+  complete, so no score, weight, or majority can substitute for a gate;
+- every `GateFailure` name distinct, non-empty, reasoned, and mapped to a
+  journalled skip state, so a JSON consumer can tell refusals apart by name;
+- plan serialisation proven stable: a fixed field set, identical text on
+  repeated serialisation, and a refusal carrying both its gate name and a
+  non-empty reason;
+- journal transitions proven exhaustively: classification is total and no state
+  is both finished and in flight, the unresolved set is exactly
+  `VALIDATING`/`RUNNING`, every non-zero result has its own exit code so a
+  scheduler can tell outcomes apart, and — the drift this catches — the name
+  written to the ledger is the same name that reaches JSON.
+
+Design decisions worth carrying forward:
+
+- **The adversarial suite lives in `tests/`, outside the crate.** It attacks
+  the product the way a user's machine does: through the real binary, the real
+  filesystem, and the real ledger. Unit tests keep proving the units; these
+  prove that the assembled thing holds.
+- **A fixture the host refuses to create is skipped explicitly, and only the
+  fixture.** The Windows reparse-point test returns early when the host denies
+  the privilege to create one, exactly as the existing Unicode-path test does
+  when a filesystem rejects the name. No production gate is relaxed and no test
+  is marked `#[ignore]`.
+- **One defect found, in a test, not in the product.** The size-parser boundary
+  test asserted that 8388608 TiB overflows. A TiB is 2^40 bytes, so the largest
+  whole TiB a u64 holds is 2^24 - 1 = 16777215; the test's own arithmetic was
+  wrong and the parser was right. The corrected test states the reason rather
+  than the magic number.
+
+Commands run locally:
+
+```text
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
+
+- `cargo fmt --check`: pass;
+- `cargo clippy --all-targets --all-features -- -D warnings`: pass, zero
+  warnings;
+- `cargo test --all-targets`: 229 passed, 0 failed, 0 ignored — 216 unit, 6
+  adversarial integration, 7 CLI integration — up from 210 at the close of
+  Day 5;
+- the run before the boundary correction failed exactly one test,
+  `config::tests::the_size_parser_never_overflows_into_a_small_number`, and it
+  failed because the test was wrong, as recorded above.
+
+Manual evidence:
+
+- none beyond the automated suite. Day 6 adds no command and no behaviour to
+  exercise by hand.
+
+Known limitations:
+
+- **The gate is not met.** `PLANS.md` requires all mandatory tests to pass on
+  Ubuntu, macOS, and Windows. Local evidence is Linux/aarch64 only, and Day 2B
+  already proved that a Linux-only run cannot qualify a filesystem-facing
+  change: one path-containment defect passed locally and failed on both other
+  platforms. This gate stays open until CI is recorded here.
+- The Windows reparse-point assertion is a property test about what the
+  platform reports, not an end-to-end refusal through the binary. The
+  integration tests that drive the real binary are Linux-only because the
+  fixture redirects the config and state directories through `XDG_*`, and a
+  Windows run would otherwise write into the real user profile. Routing the
+  Windows known folders through a fixture is the work that would close this.
+- The macOS blocker from Day 5 is untouched and still blocks release.
+
+Acceptance items supported:
+
+- L: no write occurs outside the product's own state directory and the enrolled
+  pnpm process in the exact verified workspace, asserted directly by snapshot;
+- D: a project-defined `clean` script cannot be selected, asserted by evidence
+  that never appears;
+- E: identity, not path spelling, carries authority across replacement, links,
+  case variance, and reparse points;
+- I: a corrupt ledger fails closed and is never recreated;
+- N: the result vocabulary is exhaustively named, classified, and coded.
+
+Blockers: none new. The macOS capacity blocker and the outstanding
+real-machine Day 5 scheduler verification both stand.
+
+Exact next action: push this commit, record the Ubuntu/macOS/Windows CI run
+here, and only then treat the Day 6 gate as closed. Do not begin **Day 7 —
+Release qualification** before that.
+
+### Day 7
 
 Status: **not started**
 
@@ -1293,8 +1445,11 @@ src/adapters/mod.rs
 src/adapters/pnpm.rs
 src/adapters/git.rs
 src/adapters/own_state.rs
+src/process.rs
+src/scheduler.rs
 src/platform/
 tests/cli_tests.rs
+tests/adversarial_tests.rs
 .github/workflows/ci.yml
 ```
 
@@ -1303,17 +1458,15 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Confirm the recorded Day 4 CI evidence, then begin **Day 5 — Activity
-   Protection and Native Scheduling**: process working-directory and command
-   detection, enumeration failure protecting the workspace, revalidation
-   immediately before cleanup, idempotent `enable`/`disable`, systemd user
-   timers, macOS LaunchAgents, Windows Task Scheduler, and the macOS snapshot
-   capacity rule.
-3. Do not weaken the Day 3 liveness gate to make an executor demonstration
-   work. `UnavailableLivenessProver` must keep answering `Unknown` until Day 5
-   supplies real process enumeration; a Day 4 demonstration uses an injected
-   prover and generated fixtures.
-4. Prove every path-containment change with a linked-ancestor fixture, not only
+2. Push the Day 6 commit and record its Ubuntu, macOS, and Windows CI run in
+   the Day 6 section. Until that run is recorded, the Day 6 gate is open and
+   Day 7 must not begin.
+3. Obtain the real-machine Day 5 evidence, or record the owner's decision to
+   accept the gap, before any release qualification.
+4. Do not weaken the Day 3 liveness gate to make an executor demonstration
+   work. `UnavailableLivenessProver` answers `Unknown` in production by
+   design; demonstrations use an injected prover and generated fixtures.
+5. Prove every path-containment change with a linked-ancestor fixture, not only
    a plain temporary directory, and require Ubuntu, macOS, and Windows CI
    before claiming any gate.
 
@@ -1340,8 +1493,8 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Days 5–7 remain outstanding; the Day 5 gate is not met and macOS
-        cannot perform workspace cleanup
+Reason: Day 7 remains outstanding; the Day 5 and Day 6 gates are not met, and
+        macOS cannot perform workspace cleanup
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.

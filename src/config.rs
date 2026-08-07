@@ -356,6 +356,106 @@ fn invalid_size(field: &'static str, input: &str) -> ConfigError {
 mod tests {
     use super::*;
 
+    /// The size parser sees whatever a user types. It must answer or refuse,
+    /// and never panic, overflow, or invent a value.
+    #[test]
+    fn the_size_parser_answers_or_refuses_but_never_panics() {
+        let units = [
+            "", "B", "KiB", "MiB", "GiB", "TiB", "kb", "GB", "gib", " GiB", "GiB ",
+        ];
+        let numbers = [
+            "",
+            "0",
+            "1",
+            "7",
+            "1024",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999999999",
+            "-1",
+            "1.5",
+            "0x10",
+            "١٢٣",
+            " 1",
+            "1 ",
+            "+1",
+        ];
+        for number in numbers {
+            for unit in units {
+                let input = format!("{number}{unit}");
+                match parse_size("minimum_free", &input) {
+                    // A parsed value must be exactly the product it claims.
+                    Ok(value) => {
+                        let multiplier = match unit {
+                            "B" => 1_u64,
+                            "KiB" => 1024,
+                            "MiB" => 1024_u64.pow(2),
+                            "GiB" => 1024_u64.pow(3),
+                            "TiB" => 1024_u64.pow(4),
+                            other => panic!("{other:?} must not be an accepted unit"),
+                        };
+                        let expected = number.parse::<u64>().unwrap() * multiplier;
+                        assert_eq!(value, expected, "{input} parsed wrongly");
+                    }
+                    Err(error) => {
+                        // A refusal must say what it refused.
+                        assert!(error.to_string().contains("minimum_free"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_size_parser_never_overflows_into_a_small_number() {
+        // A TiB is 2^40 bytes, so the largest whole TiB a u64 can hold is
+        // 2^24 - 1. The next one is exactly 2^64, and wrapping it would turn a
+        // preposterous threshold into a small and permissive one.
+        const LARGEST_TIB: u64 = (1 << 24) - 1;
+        assert_eq!(
+            parse_size("target_free", &format!("{LARGEST_TIB}TiB")).unwrap(),
+            LARGEST_TIB << 40
+        );
+        for overflowing in [
+            format!("{}TiB", LARGEST_TIB + 1),
+            format!("{}TiB", u64::MAX),
+        ] {
+            assert!(
+                parse_size("target_free", &overflowing).is_err(),
+                "{overflowing} must be refused, never wrapped"
+            );
+        }
+    }
+
+    /// Approved roots come from a configuration file a user can edit.
+    /// Normalisation must be total: same input, same stored list, always.
+    #[test]
+    fn approved_root_normalisation_is_deterministic_and_total() {
+        let absolute = if cfg!(windows) {
+            vec!["C:\\b", "C:\\a", "C:\\b", "C:\\a\\c"]
+        } else {
+            vec!["/b", "/a", "/b", "/a/c"]
+        };
+        let mut first = Config::default();
+        first
+            .set_approved_roots(absolute.iter().map(PathBuf::from).collect())
+            .unwrap();
+        let mut second = Config::default();
+        let mut reversed: Vec<PathBuf> = absolute.iter().map(PathBuf::from).collect();
+        reversed.reverse();
+        second.set_approved_roots(reversed).unwrap();
+        assert_eq!(first.approved_roots, second.approved_roots);
+        assert_eq!(first.approved_roots.len(), 3, "duplicates must collapse");
+
+        let mut relative = Config::default();
+        assert!(
+            relative
+                .set_approved_roots(vec![PathBuf::from("relative/path")])
+                .is_err(),
+            "a relative root must be refused rather than resolved"
+        );
+    }
+
     fn write_config(dir: &tempfile::TempDir, contents: &str) -> PathBuf {
         let path = dir.path().join(CONFIG_FILE_NAME);
         fs::write(&path, contents).unwrap();

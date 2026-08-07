@@ -329,21 +329,43 @@ impl RunRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    /// The complete vocabularies. Every exhaustive test below walks these, so
+    /// a variant added without a name, a classification, or an exit code fails
+    /// a test rather than reaching the ledger unexamined.
+    const ALL_STATES: [ActionState; 9] = [
+        ActionState::Planned,
+        ActionState::Validating,
+        ActionState::Running,
+        ActionState::Succeeded,
+        ActionState::Failed,
+        ActionState::SkippedChanged,
+        ActionState::SkippedActive,
+        ActionState::SkippedProtected,
+        ActionState::SkippedUnknown,
+    ];
+
+    const ALL_RESULTS: [RunResult; 12] = [
+        RunResult::OkNoPressure,
+        RunResult::OkTargetRestored,
+        RunResult::OkPartialSafeReclaim,
+        RunResult::ShortfallSafeActionsExhausted,
+        RunResult::SkippedActivityUncertain,
+        RunResult::SkippedProtected,
+        RunResult::SkippedSnapshotCapacityUncertain,
+        RunResult::FailedConfiguration,
+        RunResult::FailedCommand,
+        RunResult::FailedStorageMeasurement,
+        RunResult::FailedState,
+        RunResult::AlreadyRunning,
+    ];
 
     #[test]
     fn every_action_state_round_trips() {
-        for state in [
-            ActionState::Planned,
-            ActionState::Validating,
-            ActionState::Running,
-            ActionState::Succeeded,
-            ActionState::Failed,
-            ActionState::SkippedChanged,
-            ActionState::SkippedActive,
-            ActionState::SkippedProtected,
-            ActionState::SkippedUnknown,
-        ] {
+        for state in ALL_STATES {
             assert_eq!(ActionState::parse(state.as_str()), Some(state));
         }
         assert_eq!(ActionState::parse("NONSENSE"), None);
@@ -351,24 +373,84 @@ mod tests {
 
     #[test]
     fn every_result_round_trips_and_has_an_exit_code() {
-        for result in [
-            RunResult::OkNoPressure,
-            RunResult::OkTargetRestored,
-            RunResult::OkPartialSafeReclaim,
-            RunResult::ShortfallSafeActionsExhausted,
-            RunResult::SkippedActivityUncertain,
-            RunResult::SkippedProtected,
-            RunResult::SkippedSnapshotCapacityUncertain,
-            RunResult::FailedConfiguration,
-            RunResult::FailedCommand,
-            RunResult::FailedStorageMeasurement,
-            RunResult::FailedState,
-            RunResult::AlreadyRunning,
-        ] {
+        for result in ALL_RESULTS {
             assert_eq!(RunResult::parse(result.as_str()), Some(result));
             let _ = result.exit_code();
         }
         assert_eq!(RunResult::parse("NONSENSE"), None);
+    }
+
+    /// The ledger stores `as_str`; every JSON reader sees the serde name. If
+    /// the two ever drift, the recorded history and the reported history
+    /// describe the same run differently, and neither is obviously wrong.
+    #[test]
+    fn the_stored_name_and_the_json_name_are_the_same_name() {
+        for state in ALL_STATES {
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::Value::String(state.as_str().to_owned()),
+                "{state} is journalled and serialised under different names"
+            );
+        }
+        for result in ALL_RESULTS {
+            assert_eq!(
+                serde_json::to_value(result).unwrap(),
+                serde_json::Value::String(result.as_str().to_owned()),
+                "{result} is journalled and serialised under different names"
+            );
+        }
+    }
+
+    /// Exhaustive over the state vocabulary. Classification must be total and
+    /// must never let one state be read as both finished and still in flight.
+    #[test]
+    fn action_state_classification_is_total_and_consistent() {
+        for state in ALL_STATES {
+            assert!(
+                !(state.is_terminal() && state.is_unresolved()),
+                "{state} is both finished and in flight"
+            );
+            assert!(
+                !state.is_skip() || state.is_terminal(),
+                "{state} is a skip, so it is a finished action"
+            );
+            assert!(!state.as_str().is_empty());
+        }
+
+        let unresolved: Vec<_> = ALL_STATES
+            .into_iter()
+            .filter(|state| state.is_unresolved())
+            .collect();
+        assert_eq!(
+            unresolved,
+            vec![ActionState::Validating, ActionState::Running],
+            "only a started action can be left unresolvable by a crash"
+        );
+        // PLANNED is deliberately neither: it was written down and never begun.
+        assert!(!ActionState::Planned.is_terminal());
+        assert!(!ActionState::Planned.is_unresolved());
+    }
+
+    /// A scheduler sees only the exit code. Two outcomes it must react to
+    /// differently may not arrive under the same number.
+    #[test]
+    fn every_non_zero_result_has_its_own_exit_code() {
+        let mut seen: BTreeMap<u8, RunResult> = BTreeMap::new();
+        for result in ALL_RESULTS {
+            let code = result.exit_code();
+            if code == 0 {
+                continue;
+            }
+            if let Some(other) = seen.insert(code, result) {
+                panic!("{result} and {other} both exit {code}");
+            }
+        }
+        assert!(
+            ALL_RESULTS
+                .into_iter()
+                .any(|result| result.exit_code() == 0),
+            "a healthy machine must exit zero"
+        );
     }
 
     #[test]

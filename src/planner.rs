@@ -1330,6 +1330,120 @@ mod tests {
         }
     }
 
+    /// Exhaustive over all 256 combinations: only every field true is
+    /// complete. No score, weight, or majority can substitute for a gate.
+    #[test]
+    fn only_the_all_true_proof_combination_is_complete() {
+        let mut complete_count = 0;
+        for bits in 0_u16..256 {
+            let proof = ProofBundle {
+                action_allowlisted: bits & 1 != 0,
+                owner_proven: bits & 2 != 0,
+                regenerability_proven: bits & 4 != 0,
+                reference_safety_proven: bits & 8 != 0,
+                inactivity_proven: bits & 16 != 0,
+                protection_checks_passed: bits & 32 != 0,
+                executable_identity_verified: bits & 64 != 0,
+                target_identity_verified: bits & 128 != 0,
+            };
+            if proof.complete() {
+                complete_count += 1;
+                assert_eq!(bits, 255, "only every field true may be complete");
+            }
+        }
+        assert_eq!(complete_count, 1);
+    }
+
+    /// Every gate name is distinct and non-empty, so a JSON consumer can rely
+    /// on the name alone to tell refusals apart.
+    #[test]
+    fn every_gate_name_is_distinct_and_reasoned() {
+        let failures = vec![
+            GateFailure::NotInsideApprovedRoot,
+            GateFailure::WorkspaceNotPresent { status: "missing" },
+            GateFailure::TargetIdentityChanged {
+                detail: "moved".to_owned(),
+            },
+            GateFailure::DifferentVolume,
+            GateFailure::Protected(ProtectionReason::ExplicitlyProtected),
+            GateFailure::MissingMarker {
+                marker: "package.json",
+            },
+            GateFailure::PnpmNotEnrolled,
+            GateFailure::PnpmIdentityChanged {
+                detail: "changed".to_owned(),
+            },
+            GateFailure::PnpmBelowMinimumVersion {
+                found: "10.0.0".to_owned(),
+                required_major: 11,
+            },
+            GateFailure::GitStateUnknown,
+            GateFailure::GitWorktreeDirty,
+            GateFailure::ObservationWindowNotMet {
+                observed_for_millis: 1,
+                required_millis: 2,
+            },
+            GateFailure::RecentActivity {
+                inactive_for_millis: 1,
+                required_millis: 2,
+            },
+            GateFailure::CooldownActive {
+                since_last_clean_millis: 1,
+                required_millis: 2,
+            },
+            GateFailure::WorkspaceActive,
+            GateFailure::LivenessUnknown,
+            GateFailure::AutomaticWorkspaceCapReached { cap: 2 },
+        ];
+        let mut names = BTreeSet::new();
+        for failure in &failures {
+            assert!(!failure.as_str().is_empty());
+            assert!(
+                !failure.to_string().is_empty(),
+                "{failure:?} needs a reason"
+            );
+            assert!(
+                names.insert(failure.as_str()),
+                "{} is duplicated",
+                failure.as_str()
+            );
+            // Every refusal must map to a journalled skip state.
+            let _ = failure.skip_state();
+        }
+        assert_eq!(names.len(), failures.len());
+    }
+
+    /// A plan must serialise to valid, stable JSON: the executor and any
+    /// external reader depend on the shape, not on field order.
+    #[test]
+    fn a_plan_serialises_to_stable_valid_json() {
+        let plan = Fixture::new().build();
+        let text = serde_json::to_string(&plan).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let object = value.as_object().unwrap();
+        let fields: BTreeSet<_> = object.keys().map(String::as_str).collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "plan_id",
+                "policy_hash",
+                "created_at_millis",
+                "expires_at_millis",
+                "actions",
+                "skipped",
+            ])
+        );
+        // Serialising twice must produce identical text.
+        assert_eq!(text, serde_json::to_string(&plan).unwrap());
+
+        let mut dirty = Fixture::new();
+        dirty.git = GitState::Dirty;
+        let refused = serde_json::to_value(dirty.build()).unwrap();
+        let skipped = &refused["skipped"][0];
+        assert_eq!(skipped["gate"], "GIT_WORKTREE_DIRTY");
+        assert!(skipped["reason"].as_str().is_some_and(|r| !r.is_empty()));
+    }
+
     #[test]
     fn an_incomplete_bundle_is_never_complete() {
         let mut proof = own_state_proof();

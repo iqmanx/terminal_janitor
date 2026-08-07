@@ -279,6 +279,56 @@ mod tests {
         }
     }
 
+    /// Canonicalisation must be total over the ways one directory can be
+    /// spelled. Two spellings that resolved to two identities would be two
+    /// grants of authority over one directory.
+    #[test]
+    fn every_spelling_of_one_directory_produces_one_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("project");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(target.join("src")).unwrap();
+        let expected = PathIdentity::resolve(&target).unwrap();
+
+        let spellings = [
+            target.join("."),
+            target.join("src").join(".."),
+            PathBuf::from(format!("{}{}", target.display(), std::path::MAIN_SEPARATOR)),
+        ];
+        for spelling in spellings {
+            assert_eq!(
+                PathIdentity::resolve(&spelling).unwrap(),
+                expected,
+                "{} resolved to a second identity",
+                spelling.display()
+            );
+        }
+
+        // Canonicalising an already-canonical path must change nothing.
+        assert_eq!(
+            PathIdentity::resolve(expected.canonical.as_path()).unwrap(),
+            expected
+        );
+    }
+
+    /// A link with nothing behind it must be refused outright. Resolving it to
+    /// its own path would hand authority over a directory that is not there.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_link_is_an_explicit_error_rather_than_a_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("dangling");
+        std::os::unix::fs::symlink(root.path().join("never-existed"), &link).unwrap();
+        assert!(matches!(
+            PathIdentity::resolve(&link),
+            Err(IdentityError::Canonicalise { .. })
+        ));
+        assert!(matches!(
+            CanonicalPath::resolve(&link),
+            Err(IdentityError::Canonicalise { .. })
+        ));
+    }
+
     #[test]
     fn paths_with_spaces_and_unicode_resolve_losslessly() {
         let root = tempfile::tempdir().unwrap();

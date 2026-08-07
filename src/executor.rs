@@ -914,6 +914,30 @@ mod tests {
         }
     }
 
+    /// Models another process filling the volume while this run proceeds.
+    struct ShrinkingRunner<'a> {
+        volume: &'a Volume,
+        loss: u64,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl CommandRunner for ShrinkingRunner<'_> {
+        fn run(&self, request: &CommandRequest<'_>) -> Result<CommandOutcome, CommandError> {
+            self.calls
+                .borrow_mut()
+                .push(request.args.iter().map(|arg| (*arg).to_owned()).collect());
+            self.volume
+                .free
+                .set(self.volume.free.get().saturating_sub(self.loss));
+            Ok(CommandOutcome {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                output_truncated: false,
+            })
+        }
+    }
+
     struct FakeDiscovery {
         identities: BTreeMap<PathBuf, PathIdentity>,
         files: BTreeSet<PathBuf>,
@@ -1373,6 +1397,102 @@ mod tests {
             .find(|action| action.action == "PNPM_WORKSPACE_CLEAN")
             .unwrap();
         assert_eq!(clean.state, ActionState::SkippedChanged);
+    }
+
+    /// Revalidation exists for exactly this case: the path still spells the
+    /// same thing, but a different physical directory is behind it now.
+    /// Identity carries the authority, never the spelling.
+    #[test]
+    fn a_workspace_replaced_after_planning_is_skipped_rather_than_cleaned() {
+        let world = World::new(1);
+        let planned = Injected::new(&world, Liveness::Inactive, GitState::Clean);
+        let plan = build_plan(&world, &planned.planning());
+
+        let path = world.workspaces[0].canonical_path.as_path().to_path_buf();
+        let mut identities = world.discovery.identities.clone();
+        identities.insert(path.clone(), identity(&path, "a-different-directory"));
+        let replaced = FakeDiscovery {
+            identities,
+            files: world.discovery.files.clone(),
+        };
+        let planning = PProviders {
+            discovery: &replaced,
+            protection_probe: &planned.probe,
+            denied_roots: &planned.denied,
+            liveness: &planned.liveness,
+            git: &planned.git,
+        };
+
+        let volume = Volume { free: Cell::new(0) };
+        let disk = StepDisk::new(&volume);
+        let runner = FakeRunner::new(&volume, 0);
+        let mut store = world.store();
+
+        let report = run(&world, &plan, &planning, &disk, &runner, &mut store);
+        let clean = report
+            .actions
+            .iter()
+            .find(|action| action.action == "PNPM_WORKSPACE_CLEAN")
+            .unwrap();
+        assert_eq!(clean.state, ActionState::SkippedChanged);
+        assert!(
+            !runner
+                .invocations()
+                .iter()
+                .any(|(args, _)| args == &["pm".to_owned(), "clean".to_owned()]),
+            "a replaced directory must never be cleaned"
+        );
+    }
+
+    /// The volume can move underneath a run: another process may fill it while
+    /// this one works. That must not invent recovery, wrap a subtraction, or
+    /// grant an action the plan did not contain.
+    #[test]
+    fn a_volume_that_shrinks_during_a_run_invents_no_recovery() {
+        let world = World::new(2);
+        let injected = Injected::new(&world, Liveness::Inactive, GitState::Clean);
+        let planning = injected.planning();
+        let plan = build_plan(&world, &planning);
+
+        let volume = Volume {
+            free: Cell::new(500),
+        };
+        let disk = StepDisk::new(&volume);
+        let runner = ShrinkingRunner {
+            volume: &volume,
+            loss: 100,
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut store = world.store();
+
+        let report = run(&world, &plan, &planning, &disk, &runner, &mut store);
+        assert_eq!(report.result, RunResult::ShortfallSafeActionsExhausted);
+        assert_eq!(
+            report.measured_recovery_bytes(),
+            Some(0),
+            "a shrinking volume recovers nothing, never a wrapped figure"
+        );
+        for action in &report.actions {
+            assert!(
+                action.actual_bytes.is_none_or(|actual| actual == 0),
+                "{} claimed {:?} bytes back while the volume was shrinking",
+                action.action,
+                action.actual_bytes
+            );
+        }
+
+        let calls = runner.calls.borrow();
+        assert!(
+            calls.len() <= plan.actions.len(),
+            "no action beyond the plan may run: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|args| {
+                args == &["pm".to_owned(), "clean".to_owned()]
+                    || args == &["store".to_owned(), "prune".to_owned()]
+            }),
+            "only the compiled argument arrays may run: {calls:?}"
+        );
     }
 
     #[test]
