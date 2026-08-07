@@ -7,7 +7,8 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Day 1 and Day 2A complete; Day 2B locally complete, CI pending
+Current phase:  Days 1, 2A, and 2B complete; complete Day 2 gate passed on
+                Ubuntu, macOS, and Windows; Day 3 in progress
 ```
 
 ## Governing state
@@ -339,8 +340,10 @@ Do not add later-day cleanup, execution, or scheduling behavior.
 divides it: Day 2A delivered the persistent, fail-closed state and identity
 foundation; Day 2B connects it to `init`, approved-root registration,
 read-only pnpm workspace discovery, protection commands, and `scan`. Day 2B's
-implementation and local gate pass; the complete Day 2 gate remains open only
-because the unpushed Day 2B commit has no Ubuntu/macOS/Windows CI result yet.
+implementation, local gate, and cross-platform CI all pass. The complete Day 2
+gate is closed by run `31163641988` on commit `cd01c1d`, which passes format,
+strict Clippy, and the full test suite on Ubuntu, macOS, and Windows with no
+ignored test.
 
 #### Day 2A — State Ledger & Identity Safety
 
@@ -560,15 +563,14 @@ planning/proof behaviour.
 
 #### Day 2B — Registration, Discovery & CLI Workflows
 
-Status: **implementation complete locally; complete Day 2 gate pending cross-platform CI**
+Status: **complete; complete Day 2 gate passed on Ubuntu, macOS, and Windows**
 
-Date: 2026-08-02
+Date: 2026-08-02 (implementation), 2026-08-07 (cross-platform fix and gate)
 
 Commits:
 
-- focused Day 2B commit `feat: add workspace registration and read-only discovery`
-  (SHA is reported by the handover after the commit is created; this file
-  cannot contain the hash of the commit that contains it).
+- `3f1c50b` — `feat: add workspace registration and read-only discovery`
+- `cd01c1d` — `fix: canonicalise the Git observation root before containment checks`
 
 Files changed:
 
@@ -693,6 +695,63 @@ Manual evidence:
   visited identity set for the current scan, workspace observations, and at
   most 1,000 diagnostics.
 
+Cross-platform gate — 2026-08-07:
+
+The first CI run for `3f1c50b` (run `30788532065`) passed Ubuntu and failed
+macOS and Windows. Format and strict Clippy passed on all three; `cargo test`
+failed three `src/activity.rs` tests on both platforms:
+
+```text
+activity::tests::head_content_change_changes_fingerprint
+activity::tests::git_index_change_changes_bounded_fingerprint
+activity::tests::marker_and_git_observations_are_read_only_and_git_stays_unknown
+```
+
+Root cause (one defect, three failures): `read_optional_bounded` compared a
+canonicalised child path against an uncanonicalised `.git` root, so a `.git`
+child appeared to fall outside its own approved root whenever an ancestor was
+a link or an alias. macOS reaches temporary and user directories through
+`/var -> /private/var`; Windows supplies 8.3 short names such as `RUNNER~1`.
+Both platforms therefore discarded every HEAD and index fingerprint. Linux
+temporary directories are already canonical, which is why Linux passed and the
+defect was invisible locally.
+
+Fix (`cd01c1d`): canonicalise the `.git` root once, after the existing symlink
+rejection and before any containment check, then compare canonical against
+canonical. The symlink guard still runs first, so a symlinked `.git` is still
+refused rather than resolved; `git_symlink_is_not_followed` continues to pass.
+
+Regression test `activity::tests::observations_survive_a_linked_ancestor_directory`
+observes one workspace directly and again through a symlinked ancestor and
+requires identical snapshots. It reproduces the macOS and Windows failure on
+Linux: with the fix reverted it fails locally with
+`assertion failed: linked.git_head_fingerprint.is_some()`; with the fix it
+passes. It is `#[cfg(unix)]`, so it compiles on Linux and macOS only; the
+Windows short-name case is covered by the same production code path and by
+Windows CI on the three original tests.
+
+Local evidence for `cd01c1d` (Linux aarch64, Ubuntu 26.04 under proot):
+
+```text
+cargo fmt --check                                        pass
+cargo clippy --all-targets --all-features -- -D warnings  pass
+cargo test --all-targets                                  102 passed; 0 failed; 0 ignored
+```
+
+CI evidence for `cd01c1d` — run `31163641988`,
+`https://github.com/iqmanx/terminal_janitor/actions/runs/31163641988`:
+
+```text
+test (ubuntu-latest)   success   96 unit + 0 + 6 integration; 0 failed; 0 ignored
+test (macos-latest)    success   96 unit + 0 + 4 integration; 0 failed; 0 ignored
+test (windows-latest)  success   91 unit + 0 + 4 integration; 0 failed; 0 ignored
+```
+
+All three jobs ran `cargo fmt --check`, strict Clippy, and `cargo test
+--all-targets`, and all three passed. No test is ignored on any platform. The
+lower macOS and Windows counts are `#[cfg(unix)]` and Unix-only-fixture tests
+that are not compiled on Windows, not tests that were skipped at runtime.
+
 Known limitations:
 
 - Day 2 deliberately reports Git worktree state as `unknown`; it observes HEAD
@@ -702,9 +761,12 @@ Known limitations:
 - A final-component symlink is rejected for approved-root registration;
   symlinks in ancestor spelling are resolved to the exact canonical root, and
   no directory symlink encountered below it is followed.
-- Local manual evidence is Linux/aarch64. The new Day 2B commit has not been
-  pushed (owner prohibited pushing), so Ubuntu, macOS, and Windows CI results
-  are not yet available. Prior Day 2A CI is green but does not qualify Day 2B.
+- Local manual evidence remains Linux/aarch64 only. macOS and Windows evidence
+  is CI evidence, not real-machine manual evidence; the real-machine
+  generated-fixture smoke test in ACCEPTANCE.md section M stays open.
+- The three-platform fingerprint defect proves that Linux-only local runs
+  cannot qualify a filesystem-facing change. Path-containment work must be
+  proven with a linked-ancestor fixture, not only a plain temporary directory.
 
 Acceptance items supported:
 
@@ -717,20 +779,24 @@ Acceptance items supported:
 - L (Day 2 scope): status remains no-walk/read-only, scan is read-only, JSON is
   valid/stable, exclusions are exact, and human output states no cleanup;
 - D (discovery prerequisite only): all three pnpm markers are required and
-  instrumentation proves pnpm/project scripts are not invoked.
+  instrumentation proves pnpm/project scripts are not invoked;
+- M (Day 2 scope): `cargo fmt --check`, strict Clippy, and `cargo test
+  --all-targets` pass, and Ubuntu, macOS, and Windows CI all pass with no
+  ignored test. The remaining section M items belong to later days.
 
-Blockers:
+Blockers: none. The complete Day 2 gate is closed.
 
-- The complete Day 2 gate is not yet claimable because required Ubuntu, macOS,
-  and Windows CI has not run for this unpushed commit. No implementation or
-  local-test blocker remains.
+Exact next action: **Day 3 — Pnpm Adapter, Proof Gates & Planning**.
 
-Exact next action: push/open CI when authorised and require Ubuntu, macOS, and
-Windows to pass for the Day 2B commit; then mark the complete Day 2 gate passed
-and begin **Day 3 — Pnpm Adapter, Proof Gates & Planning**. Do not start Day 3
-before that CI evidence exists.
+### Day 3 — Pnpm adapter, proof gates, planning
 
-### Days 3–7
+Status: **in progress**
+
+Started 2026-08-07, immediately after the complete Day 2 gate closed on run
+`31163641988`. Day 3 produces complete, non-executable cleanup plans with
+mechanical proof for every decision. No destructive command may run in Day 3.
+
+### Days 4–7
 
 Status: **not started**
 
@@ -777,12 +843,16 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Push/open CI only when authorised and require the Day 2B commit to pass
-   Ubuntu, macOS, and Windows format, strict Clippy, and all tests.
-3. Record those CI URLs/results and mark the complete Day 2 gate passed only
-   if all three jobs pass without ignored safety tests.
-4. Then begin **Day 3 — Pnpm Adapter, Proof Gates & Planning**. Do not start
-   Day 3 before cross-platform Day 2B evidence exists.
+2. Continue **Day 3 — Pnpm Adapter, Proof Gates & Planning**: pnpm enrolment
+   during `init` with canonical executable path, version, and a minimum major
+   version of 11; typed `AllowedAction`; `ProofBundle`; ownership, reference,
+   liveness, and protection gates; cloud-sync protection; Git cleanliness;
+   observation and inactivity requirements; cooldowns; immutable plan ID,
+   expiry, and policy hash; `scan --json` explanations; and `--dry-run`.
+3. Keep Day 3 non-executable. No cleanup command may run until Day 4.
+4. Prove every path-containment change with a linked-ancestor fixture, not only
+   a plain temporary directory, and require Ubuntu, macOS, and Windows CI
+   before claiming the Day 3 gate.
 
 ## Required status-update format
 
@@ -807,7 +877,7 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Day 2B cross-platform CI and Days 3–7 remain outstanding
+Reason: Days 3–7 remain outstanding
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.
