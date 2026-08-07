@@ -1,0 +1,200 @@
+# The Day 5 gate, performed on real machines.
+#
+# `PLANS.md` sets the Day 5 gate as: on all three platforms, enable, manually
+# trigger, verify no-op above threshold, verify fixture execution below
+# threshold, and disable cleanly. The unit and integration suites prove the
+# scheduler's *content* — exact binary path, argument array, no shell, no
+# elevation, idempotence — but they never install anything. Only a real
+# operating system can prove that a schedule this product installed actually
+# fires the binary.
+#
+# GitHub's runners are real Linux, macOS, and Windows machines with real
+# systemd, launchd, and Task Scheduler, and their home directories are
+# disposable. This job therefore installs into the real user profile on
+# purpose: a fixture-redirected home would prove nothing about scheduling.
+#
+# What this job cannot prove is recorded in IMPLEMENTATION_STATUS.md: a
+# scheduled run cannot reach an actual workspace clean, because the 24-hour
+# observation window is a real safety gate and CI fixtures are seconds old.
+# That half stays proven by the injected-clock executor tests.
+
+name: Scheduler gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scheduler-gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: build
+        run: cargo build --release
+
+      # `ScheduleContext::resolve` canonicalises `current_exe` and reads the
+      # real home, so the schedule must name an installed binary, not one
+      # sitting in target/.
+      - name: install the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/terminal_janitor.exe "$HOME/bin/"
+            echo "TJ=$HOME/bin/terminal_janitor.exe" >> "$GITHUB_ENV"
+          else
+            cp target/release/terminal_janitor "$HOME/bin/"
+            echo "TJ=$HOME/bin/terminal_janitor" >> "$GITHUB_ENV"
+          fi
+
+      # systemd's user manager needs a session bus. Without lingering the
+      # runner has none, and `systemctl --user` cannot connect.
+      - name: enable a user systemd session
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if systemctl --user is-system-running >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          systemctl --user is-system-running || true
+
+      - name: register a disposable fixture, healthy thresholds
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/tj-fixture/projects"
+          mkdir -p "$root/api"
+          printf '{"name":"api"}' > "$root/api/package.json"
+          printf 'packages: []\n' > "$root/api/pnpm-workspace.yaml"
+          printf 'lockfileVersion: 9\n' > "$root/api/pnpm-lock.yaml"
+          "$TJ" init --root "$root" \
+            --minimum-free 1B --target-free 2B --json
+          "$TJ" scan --json
+
+      # Gate step: no-op above threshold. A healthy machine must do nothing
+      # and, by design, leave no journal behind for an hourly schedule to fill.
+      - name: verify the no-op above threshold
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$("$TJ" check --json)"
+          echo "$out"
+          echo "$out" | grep -q '"result": *"OK_NO_PRESSURE"' \
+            || { echo "expected OK_NO_PRESSURE"; exit 1; }
+          history="$("$TJ" history --json)"
+          echo "$history"
+          echo "$history" | grep -q '"runs": *\[\]' \
+            || { echo "a healthy run must leave no journal"; exit 1; }
+
+      - name: enable the schedule
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$TJ" enable --json
+
+      - name: verify the schedule was installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)
+              test -f "$HOME/.config/systemd/user/terminal_janitor.service"
+              test -f "$HOME/.config/systemd/user/terminal_janitor.timer"
+              systemctl --user list-timers --all | grep -q terminal_janitor
+              ;;
+            macOS)
+              test -f "$HOME/Library/LaunchAgents/io.terminal-janitor.check.plist"
+              launchctl list | grep -q io.terminal-janitor.check
+              ;;
+            Windows)
+              schtasks //Query //TN terminal_janitor
+              ;;
+          esac
+
+      # Now make a triggered run observable. A pressured run journals before it
+      # acts, so the journal is the evidence that the schedule really invoked
+      # the binary. No workspace is eligible this early, so the run reports a
+      # shortfall and exits non-zero — that is the correct, safe outcome.
+      - name: switch the fixture to a pressured threshold
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$TJ" init --root "$HOME/tj-fixture/projects" \
+            --minimum-free 900000GiB --target-free 950000GiB --json
+
+      - name: trigger the installed schedule and wait for it to fire
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A pressured run correctly exits non-zero with a shortfall, and
+          # `systemctl start` on a oneshot unit waits and reports that exit
+          # code. The trigger's own status is therefore not the evidence — the
+          # journal is — so a non-zero trigger must not end the step.
+          case "${{ runner.os }}" in
+            Linux)   systemctl --user start terminal_janitor.service || true ;;
+            macOS)   launchctl start io.terminal-janitor.check || true ;;
+            Windows) schtasks //Run //TN terminal_janitor || true ;;
+          esac
+
+          for attempt in $(seq 1 60); do
+            history="$("$TJ" history --json)" || true
+            if ! echo "$history" | grep -q '"runs": *\[\]'; then
+              echo "the schedule fired the binary after ${attempt}s"
+              echo "$history"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the installed schedule never ran the binary within 60s"
+          "$TJ" history --json || true
+          exit 1
+
+      - name: disable the schedule
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$TJ" disable --json
+
+      - name: verify the schedule was removed cleanly
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)
+              test ! -f "$HOME/.config/systemd/user/terminal_janitor.service"
+              test ! -f "$HOME/.config/systemd/user/terminal_janitor.timer"
+              ;;
+            macOS)
+              test ! -f "$HOME/Library/LaunchAgents/io.terminal-janitor.check.plist"
+              ;;
+            Windows)
+              if schtasks //Query //TN terminal_janitor >/dev/null 2>&1; then
+                echo "the scheduled task survived disable"; exit 1
+              fi
+              ;;
+          esac
+
+      # Disabling twice, and disabling something absent, must both succeed.
+      - name: verify disable is idempotent
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$TJ" disable --json
+          "$TJ" disable --json
