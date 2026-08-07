@@ -44,16 +44,21 @@ fn observe_system(workspace: &Path) -> io::Result<ActivitySnapshot> {
     }
 
     let git_path = workspace.join(".git");
-    let git_metadata = match fs::symlink_metadata(&git_path) {
+    // `.git` itself must not be a symlink, but the approved root is canonicalised
+    // before any containment check. An uncanonicalised root would reject its own
+    // children wherever an ancestor is a link or an alias: macOS reaches
+    // temporary and user directories through `/var -> /private/var`, and Windows
+    // hands out 8.3 short names such as `RUNNER~1`.
+    let git_root = match fs::symlink_metadata(&git_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => None,
-        Ok(_) => Some(git_path),
+        Ok(_) => Some(dunce::canonicalize(&git_path)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
 
     let mut head_fingerprint = None;
     let mut index_fingerprint = None;
-    if let Some(git_dir) = git_metadata {
+    if let Some(git_dir) = git_root {
         let head_path = git_dir.join("HEAD");
         if let Some((bytes, modified)) =
             read_optional_bounded(&head_path, &git_dir, MAX_HEAD_BYTES)?
@@ -264,6 +269,30 @@ mod tests {
         fs::write(git.join("index"), b"index-longer-b").unwrap();
         let second = SystemActivityProbe.observe(dir.path()).unwrap();
         assert_ne!(first.git_index_fingerprint, second.git_index_fingerprint);
+    }
+
+    /// A workspace reached through a linked ancestor is the shape macOS presents
+    /// for every temporary and user directory (`/var -> /private/var`), and the
+    /// shape Windows presents through 8.3 short names.
+    #[cfg(unix)]
+    #[test]
+    fn observations_survive_a_linked_ancestor_directory() {
+        let dir = workspace();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git.join("refs/heads/main"), b"abc\n").unwrap();
+        fs::write(git.join("index"), b"index").unwrap();
+
+        let link_parent = tempfile::tempdir().unwrap();
+        let linked_workspace = link_parent.path().join("workspace-link");
+        std::os::unix::fs::symlink(dir.path(), &linked_workspace).unwrap();
+
+        let direct = SystemActivityProbe.observe(dir.path()).unwrap();
+        let linked = SystemActivityProbe.observe(&linked_workspace).unwrap();
+        assert!(linked.git_head_fingerprint.is_some());
+        assert!(linked.git_index_fingerprint.is_some());
+        assert_eq!(direct, linked);
     }
 
     #[cfg(unix)]
