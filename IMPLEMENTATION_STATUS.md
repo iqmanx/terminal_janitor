@@ -928,6 +928,12 @@ Known limitations:
 - Local evidence is Linux/aarch64. Windows wrapper refusal is proven by unit
   tests that construct the wrapper names on any platform; no real Windows
   `pnpm.cmd` has been exercised on a Windows machine.
+- The local toolchain is cargo 1.93.1 while CI uses stable, which is currently
+  1.97. A clean local `cargo clippy -D warnings` therefore does not guarantee a
+  clean CI Clippy: the first Day 3 CI run (`31166832906`) failed on all three
+  platforms on `clippy::collapsible_match`, a lint the local toolchain does not
+  raise. Strict Clippy must be treated as a CI gate, not a local one, until the
+  local toolchain matches.
 
 Blockers: none.
 

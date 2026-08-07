@@ -279,6 +279,26 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// Test fixtures are written in one POSIX spelling and mapped to a single
+    /// absolute platform path, because Windows does not treat a rootless path
+    /// as absolute and a denied root must be absolute to be a boundary.
+    fn abs(path: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            if path == "/" {
+                return PathBuf::from("C:\\");
+            }
+            if !path.starts_with('/') {
+                return PathBuf::from(path);
+            }
+            PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(path)
+        }
+    }
+
     #[derive(Default)]
     struct FakeProbe {
         entries: BTreeSet<PathBuf>,
@@ -287,7 +307,7 @@ mod tests {
     impl FakeProbe {
         fn with(entries: &[&str]) -> Self {
             Self {
-                entries: entries.iter().map(PathBuf::from).collect(),
+                entries: entries.iter().map(|entry| abs(entry)).collect(),
             }
         }
     }
@@ -304,8 +324,8 @@ mod tests {
         probe: &dyn ProtectionProbe,
     ) -> Option<ProtectionReason> {
         evaluate(
-            Path::new(workspace),
-            Path::new(root),
+            &abs(workspace),
+            &abs(root),
             false,
             &DeniedRoots::default(),
             probe,
@@ -323,8 +343,8 @@ mod tests {
     #[test]
     fn explicit_protection_wins_before_any_other_check() {
         let reason = evaluate(
-            Path::new("/approved/api"),
-            Path::new("/approved"),
+            &abs("/approved/api"),
+            &abs("/approved"),
             true,
             &DeniedRoots::default(),
             &FakeProbe::default(),
@@ -388,11 +408,10 @@ mod tests {
 
     #[test]
     fn a_denied_root_refuses_the_workspace_and_names_the_root() {
-        let denied =
-            DeniedRoots::from_paths(vec![(PathBuf::from("/home/person/Downloads"), "downloads")]);
+        let denied = DeniedRoots::from_paths(vec![(abs("/home/person/Downloads"), "downloads")]);
         let reason = evaluate(
-            Path::new("/home/person/Downloads/api"),
-            Path::new("/home/person"),
+            &abs("/home/person/Downloads/api"),
+            &abs("/home/person"),
             false,
             &denied,
             &FakeProbe::default(),
@@ -408,11 +427,11 @@ mod tests {
 
     #[test]
     fn a_workspace_that_is_itself_a_denied_root_is_refused() {
-        let denied = DeniedRoots::from_paths(vec![(PathBuf::from("/home/person/.cache"), "cache")]);
+        let denied = DeniedRoots::from_paths(vec![(abs("/home/person/.cache"), "cache")]);
         assert!(
             evaluate(
-                Path::new("/home/person/.cache"),
-                Path::new("/home/person"),
+                &abs("/home/person/.cache"),
+                &abs("/home/person"),
                 false,
                 &denied,
                 &FakeProbe::default(),
@@ -423,12 +442,11 @@ mod tests {
 
     #[test]
     fn a_sibling_of_a_denied_root_is_not_refused_by_prefix_text() {
-        let denied =
-            DeniedRoots::from_paths(vec![(PathBuf::from("/home/person/Downloads"), "downloads")]);
+        let denied = DeniedRoots::from_paths(vec![(abs("/home/person/Downloads"), "downloads")]);
         assert_eq!(
             evaluate(
-                Path::new("/home/person/Downloads-archive/api"),
-                Path::new("/home/person"),
+                &abs("/home/person/Downloads-archive/api"),
+                &abs("/home/person"),
                 false,
                 &denied,
                 &FakeProbe::default(),
@@ -439,10 +457,8 @@ mod tests {
 
     #[test]
     fn the_filesystem_root_is_never_stored_as_a_denied_boundary() {
-        let denied = DeniedRoots::from_paths(vec![
-            (PathBuf::from("/"), "root"),
-            (PathBuf::from("relative"), "relative"),
-        ]);
-        assert_eq!(denied.covering(Path::new("/approved/api")), None);
+        let denied =
+            DeniedRoots::from_paths(vec![(abs("/"), "root"), (abs("relative"), "relative")]);
+        assert_eq!(denied.covering(&abs("/approved/api")), None);
     }
 }

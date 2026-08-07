@@ -724,6 +724,20 @@ mod tests {
     const DAY: i64 = 86_400_000;
     const NOW: i64 = 1_800_000_000_000;
     const ROOT: &str = "/approved";
+
+    /// Test fixtures are written in one POSIX spelling and mapped to a single
+    /// absolute platform path. Windows rejects a rootless path as an identity,
+    /// so the same fixture must gain a drive prefix there.
+    fn abs(path: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(path)
+        }
+    }
     const VOLUME: &str = "unix-dev:66";
 
     struct FakeProvider {
@@ -781,7 +795,7 @@ mod tests {
 
     fn identity(path: &str, file_id: &str) -> PathIdentity {
         PathIdentity::from_parts(
-            CanonicalPath::from_verified(PathBuf::from(path)).unwrap(),
+            CanonicalPath::from_verified(abs(path)).unwrap(),
             VolumeId::new(VOLUME).unwrap(),
             FileId::new(file_id).unwrap(),
         )
@@ -790,7 +804,7 @@ mod tests {
     fn approved_root() -> ApprovedRootRecord {
         ApprovedRootRecord {
             id: ApprovedRootId::for_tests("root-1"),
-            canonical_path: CanonicalPath::from_verified(PathBuf::from(ROOT)).unwrap(),
+            canonical_path: CanonicalPath::from_verified(abs(ROOT)).unwrap(),
             volume_id: VolumeId::new(VOLUME).unwrap(),
             file_id: FileId::new("root-file").unwrap(),
             created_at: Timestamp::from_unix_millis(0),
@@ -804,7 +818,7 @@ mod tests {
     fn eligible_workspace(id: &str, path: &str) -> WorkspaceRecord {
         WorkspaceRecord {
             id: WorkspaceId::for_tests(id),
-            canonical_path: CanonicalPath::from_verified(PathBuf::from(path)).unwrap(),
+            canonical_path: CanonicalPath::from_verified(abs(path)).unwrap(),
             approved_root_id: ApprovedRootId::for_tests("root-1"),
             volume_id: VolumeId::new(VOLUME).unwrap(),
             file_id: FileId::new(id).unwrap(),
@@ -926,7 +940,7 @@ mod tests {
             .find(|action| action.action == "PNPM_WORKSPACE_CLEAN")
             .unwrap();
         assert!(clean.proof.complete());
-        assert_eq!(clean.path.as_deref(), Some(Path::new("/approved/a")));
+        assert_eq!(clean.path.as_deref(), Some(abs("/approved/a").as_path()));
     }
 
     #[test]
@@ -968,9 +982,7 @@ mod tests {
             let fixture = Fixture::new();
             let borrowed: Vec<&WorkspaceRecord> = fixture.workspaces.iter().collect();
             let mut discovery = provider(&borrowed, fixture.pnpm.as_ref());
-            discovery
-                .files
-                .remove(&PathBuf::from("/approved/a").join(marker));
+            discovery.files.remove(&abs("/approved/a").join(marker));
             let liveness = FixedLiveness(Liveness::Inactive);
             let git = FixedGit(GitState::Clean);
             let probe = NoMarkers;
@@ -1057,7 +1069,7 @@ mod tests {
     #[test]
     fn a_denied_root_refuses_the_workspace() {
         let mut fixture = Fixture::new();
-        fixture.denied = DeniedRoots::from_paths(vec![(PathBuf::from("/approved/a"), "downloads")]);
+        fixture.denied = DeniedRoots::from_paths(vec![(abs("/approved/a"), "downloads")]);
         assert_eq!(single_gate(&fixture.build()), "PROTECTED");
     }
 
@@ -1096,7 +1108,7 @@ mod tests {
         let mut discovery = provider(&borrowed, moved.pnpm.as_ref());
         discovery
             .identities
-            .insert(PathBuf::from("/approved/a"), identity("/approved/a", "a"));
+            .insert(abs("/approved/a"), identity("/approved/a", "a"));
         let liveness = FixedLiveness(Liveness::Inactive);
         let git = FixedGit(GitState::Clean);
         let probe = NoMarkers;
@@ -1156,10 +1168,7 @@ mod tests {
             .iter()
             .filter_map(|action| action.path.as_deref())
             .collect();
-        assert_eq!(
-            cleaned,
-            vec![Path::new("/approved/b"), Path::new("/approved/c")]
-        );
+        assert_eq!(cleaned, vec![abs("/approved/b"), abs("/approved/c")]);
     }
 
     #[test]
@@ -1177,10 +1186,7 @@ mod tests {
             .iter()
             .filter_map(|action| action.path.as_deref())
             .collect();
-        assert_eq!(
-            cleaned,
-            vec![Path::new("/approved/b"), Path::new("/approved/c")]
-        );
+        assert_eq!(cleaned, vec![abs("/approved/b"), abs("/approved/c")]);
     }
 
     #[test]
@@ -1266,7 +1272,7 @@ mod tests {
         assert_eq!(skipped.gate, "GIT_WORKTREE_DIRTY");
         assert!(!skipped.reason.is_empty());
         assert_eq!(skipped.workspace_id, "workspace-a");
-        assert_eq!(skipped.path, PathBuf::from("/approved/a"));
+        assert_eq!(skipped.path, abs("/approved/a"));
     }
 
     #[test]

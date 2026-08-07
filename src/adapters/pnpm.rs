@@ -342,16 +342,13 @@ pub fn locate_on_path() -> Option<PathBuf> {
         }
         for candidate_name in candidate_file_names() {
             let candidate = directory.join(candidate_name);
-            match fs::symlink_metadata(&candidate) {
-                Ok(metadata) if metadata.is_file() => return Some(candidate),
-                // A symlinked entry is normal for a package manager; resolve it
-                // and accept it only when it points at a regular file.
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    if fs::metadata(&candidate).is_ok_and(|target| target.is_file()) {
-                        return Some(candidate);
-                    }
-                }
-                _ => {}
+            // `metadata` follows links, which is what is wanted here: a package
+            // manager on `PATH` is very often a symlink, and it is acceptable
+            // exactly when it resolves to a regular file. Enrolment then
+            // canonicalises the candidate, so the stored identity is the real
+            // executable rather than this spelling.
+            if fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file()) {
+                return Some(candidate);
             }
         }
     }
