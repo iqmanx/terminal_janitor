@@ -59,6 +59,55 @@ README.md
 
 No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
 
+## Installing
+
+Everything below happens inside your own account. Nothing asks for
+administrator rights, and nothing is scheduled until you ask for it.
+
+Linux and macOS:
+
+```sh
+./install.sh                          # latest release into ~/.local/bin
+./install.sh --version v0.1.0         # an exact release
+./install.sh --prefix "$HOME/bin"     # somewhere else
+```
+
+Windows (PowerShell):
+
+```powershell
+.\install.ps1
+```
+
+Release archives are verified against `SHA256SUMS` before they are unpacked; a
+missing or mismatched checksum refuses the install rather than continuing.
+
+Removing it again:
+
+```sh
+./uninstall.sh            # removes the schedule, then the binary
+./uninstall.sh --purge    # also removes configuration and protection state
+```
+
+```powershell
+.\uninstall.ps1
+.\uninstall.ps1 -Purge
+```
+
+Uninstall removes the schedule *before* the binary, because a schedule left
+pointing at a deleted binary would fail every hour forever. Configuration and
+protection state are kept unless you pass `--purge`: they record which roots
+you approved and which workspaces you protected, and deleting that silently
+would be the one irreversible thing an uninstaller could do. Upgrading by
+re-running the installer never touches either.
+
+Nothing runs automatically until you turn it on:
+
+```sh
+terminal_janitor init --root /path/to/your/projects
+terminal_janitor enable      # hourly, per-user
+terminal_janitor disable     # stops it again
+```
+
 ## Current CLI (Day 5)
 
 ```text

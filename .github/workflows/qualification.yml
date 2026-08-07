@@ -1,0 +1,217 @@
+# Release qualification for terminal_janitor (Day 7).
+#
+# `ACCEPTANCE.md` requires two things no unit test can give: install and
+# uninstall working from a clean user account, and a generated pnpm fixture
+# smoke test on a real Linux, macOS, and Windows machine. Both are performed
+# here against the real installers and the real binary.
+#
+# What each job proves, and what it does not, is recorded in
+# IMPLEMENTATION_STATUS.md. In particular the installers' download-and-verify
+# path can only be exercised end to end once a release exists; until then the
+# checksum job proves the sums are correct and `--from` proves the install
+# path.
+
+name: Qualification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture-smoke:
+    name: generated fixture smoke test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: build
+        run: cargo build --release
+
+      - name: install through the real installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pwsh -File ./install.ps1 -From ./target/release/terminal_janitor.exe
+            echo "TJ=$LOCALAPPDATA\\Programs\\terminal_janitor\\terminal_janitor.exe" >> "$GITHUB_ENV"
+          else
+            ./install.sh --from ./target/release/terminal_janitor
+            echo "TJ=$HOME/.local/bin/terminal_janitor" >> "$GITHUB_ENV"
+          fi
+
+      # An installer must not start anything. Nothing may be scheduled until
+      # the user asks for it.
+      - name: verify the install enabled no schedule
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)
+              test ! -f "$HOME/.config/systemd/user/terminal_janitor.timer" \
+                || { echo "install enabled a schedule"; exit 1; } ;;
+            macOS)
+              test ! -f "$HOME/Library/LaunchAgents/io.terminal-janitor.check.plist" \
+                || { echo "install enabled a schedule"; exit 1; } ;;
+            Windows)
+              if schtasks //Query //TN terminal_janitor >/dev/null 2>&1; then
+                echo "install enabled a schedule"; exit 1
+              fi ;;
+          esac
+
+      # A generated fixture with spaces and a non-ASCII name, because those are
+      # the paths that break path handling on someone else's machine.
+      - name: generate the pnpm fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/qualification/my projects"
+          ws="$root/café api"
+          mkdir -p "$ws/src" "$ws/node_modules/left-pad"
+          printf '{"name":"api","scripts":{"clean":"exit 1"}}' > "$ws/package.json"
+          printf 'packages: []\n' > "$ws/pnpm-workspace.yaml"
+          printf 'lockfileVersion: 9\n' > "$ws/pnpm-lock.yaml"
+          printf 'export const answer = 42;\n' > "$ws/src/main.ts"
+          printf 'module\n' > "$ws/node_modules/left-pad/index.js"
+          echo "TJ_ROOT=$root" >> "$GITHUB_ENV"
+          echo "TJ_WS=$ws" >> "$GITHUB_ENV"
+
+      - name: record the fixture before anything runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$TJ_ROOT" -type f -exec sha256sum {} + 2>/dev/null | sort -k2 > "$HOME/before.sums" \
+            || find "$TJ_ROOT" -type f -exec shasum -a 256 {} + | sort -k2 > "$HOME/before.sums"
+          cat "$HOME/before.sums"
+
+      - name: drive every read-only workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$TJ" --version
+          "$TJ" status --json
+          "$TJ" init --root "$TJ_ROOT" --minimum-free 1B --target-free 2B --json
+          "$TJ" scan --json
+          "$TJ" protect add "$TJ_WS" --json
+          "$TJ" protect list --json
+          "$TJ" check --json
+          "$TJ" history --json
+          "$TJ" protect remove "$TJ_WS" --json
+
+      # The whole product exists to be trusted with a real project directory.
+      # Not one byte of it may change.
+      - name: verify the fixture is byte-identical
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$TJ_ROOT" -type f -exec sha256sum {} + 2>/dev/null | sort -k2 > "$HOME/after.sums" \
+            || find "$TJ_ROOT" -type f -exec shasum -a 256 {} + | sort -k2 > "$HOME/after.sums"
+          diff "$HOME/before.sums" "$HOME/after.sums" \
+            || { echo "the fixture changed"; exit 1; }
+          echo "the fixture is byte-identical"
+
+      - name: uninstall and verify state survives
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pwsh -File ./uninstall.ps1
+            test ! -f "$TJ" || { echo "the binary survived uninstall"; exit 1; }
+            test -d "$APPDATA/terminal_janitor" || test -d "$LOCALAPPDATA/terminal_janitor" \
+              || { echo "uninstall removed state it was told to keep"; exit 1; }
+            pwsh -File ./uninstall.ps1 -Purge
+          else
+            ./uninstall.sh
+            test ! -f "$TJ" || { echo "the binary survived uninstall"; exit 1; }
+            test -d "${XDG_CONFIG_HOME:-$HOME/.config}/terminal_janitor" \
+              || test -d "$HOME/Library/Application Support/terminal_janitor" \
+              || { echo "uninstall removed state it was told to keep"; exit 1; }
+            ./uninstall.sh --purge
+          fi
+          echo "uninstall kept state, then purged it on request"
+
+  clean-account:
+    name: install and uninstall from a clean account
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: build
+        run: cargo build --release
+
+      # A genuinely fresh account: a new home, no PATH entry, no prior
+      # configuration, and no membership of any group the build user has.
+      - name: create a clean user account
+        run: |
+          set -euo pipefail
+          sudo useradd --create-home --shell /bin/bash tjfresh
+          sudo install -m 0755 target/release/terminal_janitor /usr/local/share/terminal_janitor-build
+          sudo install -m 0755 install.sh /home/tjfresh/install.sh
+          sudo install -m 0755 uninstall.sh /home/tjfresh/uninstall.sh
+          sudo chown tjfresh:tjfresh /home/tjfresh/install.sh /home/tjfresh/uninstall.sh
+
+      - name: install as that user, with no administrator rights
+        run: |
+          set -euo pipefail
+          sudo -u tjfresh -H bash -lc '
+            set -euo pipefail
+            cd "$HOME"
+            ./install.sh --from /usr/local/share/terminal_janitor-build
+            test -x "$HOME/.local/bin/terminal_janitor"
+            "$HOME/.local/bin/terminal_janitor" --version
+            mkdir -p "$HOME/projects/api"
+            printf "{\"name\":\"api\"}" > "$HOME/projects/api/package.json"
+            printf "packages: []\n" > "$HOME/projects/api/pnpm-workspace.yaml"
+            printf "lockfileVersion: 9\n" > "$HOME/projects/api/pnpm-lock.yaml"
+            "$HOME/.local/bin/terminal_janitor" init --root "$HOME/projects" --json
+            "$HOME/.local/bin/terminal_janitor" scan --json
+            test -f "$HOME/.config/terminal_janitor/config.toml"
+          '
+
+      - name: verify no schedule was enabled by installing
+        run: |
+          set -euo pipefail
+          sudo -u tjfresh -H bash -lc '
+            test ! -f "$HOME/.config/systemd/user/terminal_janitor.timer"
+          '
+
+      - name: upgrade in place and verify configuration survives
+        run: |
+          set -euo pipefail
+          sudo -u tjfresh -H bash -lc '
+            set -euo pipefail
+            cd "$HOME"
+            before="$(sha256sum "$HOME/.config/terminal_janitor/config.toml" | cut -d" " -f1)"
+            ./install.sh --from /usr/local/share/terminal_janitor-build
+            after="$(sha256sum "$HOME/.config/terminal_janitor/config.toml" | cut -d" " -f1)"
+            [ "$before" = "$after" ] || { echo "upgrade changed configuration"; exit 1; }
+            echo "upgrade preserved configuration"
+          '
+
+      - name: uninstall as that user
+        run: |
+          set -euo pipefail
+          sudo -u tjfresh -H bash -lc '
+            set -euo pipefail
+            cd "$HOME"
+            ./uninstall.sh
+            test ! -f "$HOME/.local/bin/terminal_janitor"
+            test -f "$HOME/.config/terminal_janitor/config.toml"
+            ./uninstall.sh --purge
+            test ! -d "$HOME/.config/terminal_janitor"
+            echo "clean-account install and uninstall both succeeded"
+          '

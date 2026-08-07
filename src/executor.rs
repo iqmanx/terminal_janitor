@@ -759,11 +759,11 @@ mod tests {
     use crate::adapters::{CommandError, CommandOutcome};
     use crate::discovery::{DirectoryEntry, DiscoveryProvider, EntryKind};
     use crate::identity::{CanonicalPath, FileId, IdentityError, PathIdentity};
-    use crate::journal::RunRecord;
+    use crate::journal::{MAX_DETAILED_RUNS, RunRecord};
     use crate::model::DiskCapacity;
     use crate::planner::{
         GitProver, Liveness, LivenessProver, PlanningInputs as PInputs,
-        PlanningProviders as PProviders, plan,
+        PlanningProviders as PProviders, WORKSPACE_COOLDOWN_MILLIS, plan,
     };
     use crate::protection::{DeniedRoots, ProtectionProbe};
     use crate::state::{FixedClock, GitState, SqliteStateStore};
@@ -1492,6 +1492,149 @@ mod tests {
                     || args == &["store".to_owned(), "prune".to_owned()]
             }),
             "only the compiled argument arrays may run: {calls:?}"
+        );
+    }
+
+    /// `ACCEPTANCE.md` section M: at least 1,000 simulated scheduler cycles.
+    ///
+    /// This drives the real planner, the real executor, and a real ledger
+    /// through 1,000 hourly cycles — about 41 simulated days — with the clock
+    /// advancing between them. The individual tests each pin one behaviour at
+    /// one instant; this one asks whether the invariants survive being run
+    /// over and over, which is what a scheduler actually does to this code.
+    ///
+    /// The volume never recovers, so every cycle is pressured and no cycle can
+    /// coast. What must hold across all of them: the two-workspace automatic
+    /// cap is never exceeded, the seven-day cooldown is always respected, only
+    /// the compiled argument arrays are ever invoked, the journal stays inside
+    /// its 200-run cap, and the ledger stays far inside its 20 MiB bound.
+    #[test]
+    fn a_thousand_scheduler_cycles_hold_every_invariant() {
+        const CYCLES: i64 = 1_000;
+        const HOUR: i64 = 60 * 60 * 1000;
+
+        let world = World::new(3);
+        let injected = Injected::new(&world, Liveness::Inactive, GitState::Clean);
+        let planning = injected.planning();
+
+        // A volume that never recovers: each cycle stays under the target, so
+        // the loop always has work to consider.
+        let volume = Volume { free: Cell::new(0) };
+        let disk = StepDisk::new(&volume);
+        let clock = FixedClock::new(NOW);
+        let mut store =
+            SqliteStateStore::open_with_clock(&world.state_path, Box::new(clock.clone())).unwrap();
+
+        let mut cleans_by_path: BTreeMap<PathBuf, Vec<i64>> = BTreeMap::new();
+        let mut runs_with_actions = 0_u32;
+
+        for cycle in 0..CYCLES {
+            let now = NOW + cycle * HOUR;
+            clock.set(now);
+            let runner = FakeRunner::new(&volume, 0);
+
+            let plan = plan(
+                &PInputs {
+                    workspaces: &store.list_workspaces().unwrap(),
+                    approved_roots: &world.roots,
+                    pnpm: Some(&world.pnpm),
+                    pressured_volume: &VolumeId::new(VOLUME).unwrap(),
+                    config: &world.config,
+                    now: Timestamp::from_unix_millis(now),
+                },
+                &planning,
+            );
+            assert!(
+                plan.workspace_clean_count() <= 2,
+                "cycle {cycle} planned {} workspace cleans, over the automatic cap",
+                plan.workspace_clean_count()
+            );
+
+            let report = execute(
+                &ExecutionInputs {
+                    plan: &plan,
+                    workspaces: &store.list_workspaces().unwrap(),
+                    approved_roots: &world.roots,
+                    config: &world.config,
+                    volume_path: &world.state_directory,
+                    pressured_volume: &VolumeId::new(VOLUME).unwrap(),
+                    pnpm: Some(&world.pnpm),
+                    state_directory: &world.state_directory,
+                },
+                &ExecutionProviders {
+                    disk: &disk,
+                    runner: &runner,
+                    clock: &clock,
+                    planning: &planning,
+                },
+                &mut store,
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle} failed: {error}"));
+
+            for (args, _) in runner.invocations() {
+                assert!(
+                    args == ["pm".to_owned(), "clean".to_owned()]
+                        || args == ["store".to_owned(), "prune".to_owned()],
+                    "cycle {cycle} invoked {args:?}, which is not a compiled argument array"
+                );
+            }
+
+            let cleaned: Vec<_> = report
+                .actions
+                .iter()
+                .filter(|action| {
+                    action.action == "PNPM_WORKSPACE_CLEAN"
+                        && action.state == ActionState::Succeeded
+                })
+                .collect();
+            assert!(
+                cleaned.len() <= 2,
+                "cycle {cycle} cleaned more than the cap"
+            );
+            if !report.actions.is_empty() {
+                runs_with_actions += 1;
+            }
+
+            for action in cleaned {
+                let path = action.path.clone().expect("a clean names its workspace");
+                let history = cleans_by_path.entry(path.clone()).or_default();
+                if let Some(previous) = history.last() {
+                    assert!(
+                        now - previous >= WORKSPACE_COOLDOWN_MILLIS,
+                        "{} was cleaned {}ms after the previous clean, inside the cooldown",
+                        path.display(),
+                        now - previous
+                    );
+                }
+                history.push(now);
+            }
+        }
+
+        // The journal is capped, and a scheduler running hourly forever must
+        // not be able to grow it past that cap.
+        let runs = store.list_runs(10_000).unwrap();
+        assert!(
+            runs.len() <= MAX_DETAILED_RUNS,
+            "the journal grew to {} runs, past the {MAX_DETAILED_RUNS} cap",
+            runs.len()
+        );
+
+        // The simulation has to have done something, or it proves nothing.
+        assert!(
+            runs_with_actions > 0,
+            "no cycle attempted any action; the simulation was vacuous"
+        );
+        let total_cleans: usize = cleans_by_path.values().map(Vec::len).sum();
+        assert!(
+            total_cleans > 0,
+            "no workspace was ever cleaned across {CYCLES} cycles"
+        );
+
+        // 1,000 runs of metadata must stay far inside the 20 MiB bound.
+        let ledger = std::fs::metadata(&world.state_path).unwrap().len();
+        assert!(
+            ledger < 20 * 1024 * 1024,
+            "the ledger reached {ledger} bytes after {CYCLES} cycles"
         );
     }
 
