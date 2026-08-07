@@ -167,7 +167,10 @@ jobs:
       - name: install as that user, with no administrator rights
         run: |
           set -euo pipefail
-          sudo -u tjfresh -H bash -lc '
+          sudo -u tjfresh env -i \
+            HOME=/home/tjfresh USER=tjfresh LOGNAME=tjfresh \
+            PATH=/usr/local/bin:/usr/bin:/bin SHELL=/bin/bash \
+            bash -lc '
             set -euo pipefail
             cd "$HOME"
             ./install.sh --from /usr/local/share/terminal_janitor-build
@@ -185,14 +188,20 @@ jobs:
       - name: verify no schedule was enabled by installing
         run: |
           set -euo pipefail
-          sudo -u tjfresh -H bash -lc '
+          sudo -u tjfresh env -i \
+            HOME=/home/tjfresh USER=tjfresh LOGNAME=tjfresh \
+            PATH=/usr/local/bin:/usr/bin:/bin SHELL=/bin/bash \
+            bash -lc '
             test ! -f "$HOME/.config/systemd/user/terminal_janitor.timer"
           '
 
       - name: upgrade in place and verify configuration survives
         run: |
           set -euo pipefail
-          sudo -u tjfresh -H bash -lc '
+          sudo -u tjfresh env -i \
+            HOME=/home/tjfresh USER=tjfresh LOGNAME=tjfresh \
+            PATH=/usr/local/bin:/usr/bin:/bin SHELL=/bin/bash \
+            bash -lc '
             set -euo pipefail
             cd "$HOME"
             before="$(sha256sum "$HOME/.config/terminal_janitor/config.toml" | cut -d" " -f1)"
@@ -205,7 +214,10 @@ jobs:
       - name: uninstall as that user
         run: |
           set -euo pipefail
-          sudo -u tjfresh -H bash -lc '
+          sudo -u tjfresh env -i \
+            HOME=/home/tjfresh USER=tjfresh LOGNAME=tjfresh \
+            PATH=/usr/local/bin:/usr/bin:/bin SHELL=/bin/bash \
+            bash -lc '
             set -euo pipefail
             cd "$HOME"
             ./uninstall.sh
