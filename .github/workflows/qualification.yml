@@ -231,6 +231,16 @@ jobs:
           Add-LocalGroupMember -Group 'Users' -Member 'tjfresh'
           $credential = New-Object System.Management.Automation.PSCredential('tjfresh', $password)
 
+          # Pre-create the profile the new account will use. Creating it
+          # under C:\Users needs rights the fresh account does not have, and
+          # Start-Process -Credential does not load a profile itself.
+          $profileRoot = 'C:\Users\tjfresh'
+          New-Item -ItemType Directory -Path $profileRoot -Force | Out-Null
+          $profileAcl = Get-Acl $profileRoot
+          $profileAcl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            'tjfresh', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+          Set-Acl $profileRoot $profileAcl
+
           $share = 'C:\tjshare'
           New-Item -ItemType Directory -Path $share -Force | Out-Null
           Copy-Item target\release\terminal_janitor.exe $share
