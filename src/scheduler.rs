@@ -174,17 +174,28 @@ fn run(
     args: &[&str],
     tolerate_failure: bool,
 ) -> Result<(), ScheduleError> {
-    let outcome = runner
-        .run(&CommandRequest {
-            program: Path::new(program),
-            args,
-            working_directory: None,
-            timeout: SCHEDULER_TIMEOUT,
-        })
-        .map_err(|error| ScheduleError::Command {
-            program: program.to_owned(),
-            detail: error.to_string(),
-        })?;
+    let started = runner.run(&CommandRequest {
+        program: Path::new(program),
+        args,
+        working_directory: None,
+        timeout: SCHEDULER_TIMEOUT,
+    });
+    let outcome = match started {
+        Ok(outcome) => outcome,
+        // A command that cannot even be started is no more authoritative than
+        // one that runs and complains. Where the caller has already decided
+        // this command does not decide anything — `disable`, where removing
+        // the unit files is what actually disables the schedule — a machine
+        // with no scheduler tool at all must still be able to disable, and
+        // therefore to uninstall, cleanly.
+        Err(_) if tolerate_failure => return Ok(()),
+        Err(error) => {
+            return Err(ScheduleError::Command {
+                program: program.to_owned(),
+                detail: error.to_string(),
+            });
+        }
+    };
     if outcome.succeeded() || tolerate_failure {
         return Ok(());
     }
@@ -509,6 +520,19 @@ mod tests {
         }
     }
 
+    /// A machine where the scheduler tool is not installed at all: the command
+    /// cannot be started, as distinct from starting and reporting a failure.
+    struct MissingToolRunner;
+
+    impl CommandRunner for MissingToolRunner {
+        fn run(&self, request: &CommandRequest<'_>) -> Result<CommandOutcome, CommandError> {
+            Err(CommandError::Spawn {
+                program: request.program.to_path_buf(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })
+        }
+    }
+
     impl CommandRunner for FakeRunner {
         fn run(&self, request: &CommandRequest<'_>) -> Result<CommandOutcome, CommandError> {
             self.calls.borrow_mut().push((
@@ -671,6 +695,45 @@ mod tests {
         for path in &report.files {
             assert!(!path.exists());
         }
+    }
+
+    /// A machine with no scheduler tool at all — a container, a minimal
+    /// distribution, a Termux userland — must still be able to disable, and
+    /// therefore to uninstall, cleanly.
+    ///
+    /// Tolerating a command's *failure* is not the same as tolerating being
+    /// unable to start it, and the original code only did the first. The
+    /// second is what a machine without systemd actually does, and it made
+    /// `disable` return `FAILED_CONFIGURATION` with no way for the user to
+    /// remove the schedule.
+    #[test]
+    fn disable_succeeds_when_the_scheduler_tool_is_not_installed() {
+        let home = tempfile::tempdir().unwrap();
+        let context = context(home.path());
+
+        let report = disable(&context, &MissingToolRunner).expect("disable must not need the tool");
+        assert_eq!(report.result, "SCHEDULE_DISABLED");
+
+        // And when units do exist, they are still removed.
+        #[cfg(target_os = "linux")]
+        {
+            enable(&context, &FakeRunner::ok()).unwrap();
+            let removed = disable(&context, &MissingToolRunner).unwrap();
+            assert_eq!(removed.files.len(), 2);
+            for path in &removed.files {
+                assert!(!path.exists(), "{} survived disable", path.display());
+            }
+        }
+    }
+
+    /// The mirror image: enabling genuinely requires the tool, so a missing
+    /// one must be reported rather than quietly reported as scheduled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn enable_still_fails_when_the_scheduler_tool_is_not_installed() {
+        let home = tempfile::tempdir().unwrap();
+        let error = enable(&context(home.path()), &MissingToolRunner).unwrap_err();
+        assert!(matches!(error, ScheduleError::Command { .. }));
     }
 
     #[test]

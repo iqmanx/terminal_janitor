@@ -1,0 +1,123 @@
+# Release artefacts for terminal_janitor.
+#
+# `ACCEPTANCE.md` section A requires checksummed artefacts for the supported
+# targets. Every artefact is built by this workflow from a tagged commit; none
+# is ever uploaded from a developer machine, so the checksums describe exactly
+# what the repository contained.
+#
+# `workflow_dispatch` builds and uploads the artefacts to the run without
+# publishing a release, which is how the release qualification exercises the
+# real artefacts before anyone decides to tag.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # One executable per archive, named exactly `terminal_janitor`, so the
+      # installers can unpack without inspecting the archive's shape.
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="terminal_janitor-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/terminal_janitor.exe" .
+            7z a "dist/$name.zip" terminal_janitor.exe >/dev/null
+          else
+            cp "target/${{ matrix.target }}/release/terminal_janitor" .
+            tar -czf "dist/$name.tar.gz" terminal_janitor
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: artefact-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: incoming
+          merge-multiple: true
+
+      # One SHA256SUMS covering every artefact, in the format both installers
+      # parse. The installers refuse to unpack anything that is not listed here
+      # or whose hash does not match.
+      - name: checksum every artefact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mv incoming/* dist/
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          # `sha256sum ./*` writes "./name"; the installers match on the bare
+          # file name, so strip the prefix.
+          sed -i 's| \./| |' SHA256SUMS
+          cat SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-artefacts
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: checksums
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-artefacts
+          path: dist
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Checksums are in SHA256SUMS. Scheduling is opt-in: run \`terminal_janitor enable\`." \
+            dist/*
