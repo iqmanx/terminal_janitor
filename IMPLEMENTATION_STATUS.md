@@ -8,7 +8,10 @@ Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
 Current phase:  Days 1 through 4 complete, every gate passed on Ubuntu,
-                macOS, and Windows; Day 5 in progress
+                macOS, and Windows. Day 5 is implemented but its gate is
+                NOT met: it requires real-machine scheduler verification on
+                all three platforms, and macOS cannot clean a workspace at
+                all until snapshot-aware capacity measurement exists.
 ```
 
 ## Governing state
@@ -1112,14 +1115,141 @@ did not bite here.
 
 Blockers: none. The Day 4 gate is closed.
 
-Exact next action: **Day 5 — Activity Protection and Native Scheduling**.
+Exact next action: obtain real-machine Day 5 evidence, or record the owner's
+decision on the macOS capacity blocker.
 
 ### Day 5 — Activity protection and native scheduling
 
-Status: **in progress**
+Status: **implemented; the Day 5 gate is NOT claimable — see "Gate not met"**
 
-Started 2026-08-07, immediately after the Day 4 gate closed on run
-`31183103708`.
+Date: 2026-08-07
+
+Started immediately after the Day 4 gate closed on run `31183103708`.
+
+Files changed:
+
+```text
+src/process.rs    (new)
+src/scheduler.rs  (new)
+src/platform/mod.rs
+src/disk.rs
+src/executor.rs
+src/workflows.rs
+src/cli.rs
+src/main.rs
+src/lib.rs
+tests/cli_tests.rs
+Cargo.toml
+Cargo.lock
+README.md
+IMPLEMENTATION_STATUS.md
+```
+
+Dependencies added and why:
+
+- `sysinfo = "0.38"` with `default-features = false, features = ["system"]` —
+  the process table with working directory, command line, executable, and
+  owning user on all three platforms. The alternative was writing unsafe FFI
+  three times: `/proc` on Linux, `libproc` on macOS, and a PEB read on Windows.
+  Day 1A chose `fs4` for the same reason, so this follows the established
+  precedent of preferring a maintained crate over unsafe code in this crate.
+
+Delivered:
+
+- real process liveness replacing the Day 3 placeholder: a working directory
+  inside the workspace is active, a command argument naming the workspace is
+  active, a failed enumeration is unknown, and an unreadable working directory
+  is unknown when the process belongs to this user or is a package tool;
+- the production planner and executor now use it, so a real machine can finally
+  reach the workspace path;
+- native per-user scheduling: a systemd user timer, a macOS LaunchAgent, and a
+  per-user Windows scheduled task, each naming the canonicalised installed
+  binary and running `check` as a bare argument with no shell pipeline;
+- idempotent `enable` and `disable`, including disabling something that was
+  never installed;
+- the macOS capacity rule: free space there is reported as
+  `SnapshotUncertain`, workspace cleans are refused while it is, and the run
+  reports `SKIPPED_SNAPSHOT_CAPACITY_UNCERTAIN`.
+
+Design decisions worth carrying forward:
+
+- **Another user's unreadable process does not block a clean; this user's
+  does.** A root daemon's working directory is routinely unreadable to a
+  per-user tool. Treating that as uncertainty would mean never cleaning
+  anything on any normal machine, so the line is drawn at processes this user
+  owns — plus any package-manager process whoever owns it, since those are
+  exactly the ones that would be working in a workspace.
+- **Removing the units is what disables the schedule.** `systemctl --user
+  disable` complains when the timer was never enabled, so its failure is
+  tolerated while filesystem removal stays authoritative. The same reasoning
+  applies to `launchctl unload` and `schtasks /Delete`.
+- **Capacity ambiguity outranks a shortfall in the result.** Own-state cleanup
+  and a store prune completing is not the news; the news is that workspace
+  cleaning was blocked and the free-space figure cannot be relied on.
+
+Commands run locally:
+
+```text
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
+
+- 210/210 tests pass, 0 failed, 0 ignored (203 unit + 7 integration), up from
+  187 at the close of Day 4;
+- liveness tests cover a failed enumeration, a working directory inside the
+  workspace, a command referencing it, an unrelated process, a sibling
+  directory that merely shares a name prefix, this user's unreadable process,
+  another user's unreadable process, an unreadable package tool for each of the
+  seven tool names, and active outranking unknown in the report;
+- two probes run against the real process table on whatever platform is
+  executing: enumeration must succeed and see this process, and this platform
+  must report our own working directory;
+- scheduler tests cover the exact binary in the systemd unit, the LaunchAgent
+  argument array, and the Windows task arguments; the absence of any shell,
+  pipeline, `sudo`, `runas`, `pkexec`, `/RL`, `/RU`, or `HIGHEST`; idempotent
+  enable writing identical files twice; idempotent disable including when
+  nothing is installed; a failing enable being reported; and a failing
+  `systemctl` still removing the units;
+- executor tests cover an ambiguous capacity figure refusing the workspace
+  clean while own-state cleanup and the store prune still run, and that no
+  compiled argument array can contain `tmutil`, `snapshot`, `thin`,
+  `diskutil`, or `apfs`.
+
+## Gate not met
+
+`PLANS.md` sets the Day 5 gate as: *on all three platforms, enable, manually
+trigger, verify no-op above threshold, verify fixture execution below
+threshold, and disable cleanly.* That is a real-machine gate. CI compiles and
+runs the test suite on all three platforms but installs no scheduler, triggers
+no timer, and creates no pressured volume. **No part of that gate has been
+performed on a real macOS or Windows machine, and the schedulers have not been
+installed on a real Linux machine either.** The Day 5 gate is therefore open,
+and the implementation below must not be read as evidence that it passed.
+
+## Blockers
+
+1. **macOS cannot clean a workspace at all.** `platform::capacity_confidence`
+   reports `SnapshotUncertain` unconditionally on macOS, because this product
+   has no snapshot-aware capacity measurement and `ACCEPTANCE.md` section K
+   requires unresolved ambiguity to block workspace cleaning. The fix is a real
+   measurement — the Foundation key `volumeAvailableCapacityForImportantUsage`
+   is the documented source — after which the confidence check can distinguish
+   rather than refuse. Until then macOS users get own-state cleanup and store
+   pruning only. This is safe, and it is also a serious product gap that the
+   owner should decide about before release.
+2. **Real-machine scheduler verification is outstanding on all three
+   platforms**, as described under "Gate not met".
+3. Whether Windows can report a process working directory is answered by the
+   `this_platform_reports_the_working_directory_of_our_own_process` probe in
+   CI. If that probe fails on Windows, Windows can never prove liveness and
+   therefore can never clean a workspace either, which would be a second
+   platform blocker of the same shape as the macOS one.
+
+Exact next action: obtain real-machine Day 5 evidence on Linux, macOS, and
+Windows, or record the owner's decision to accept the gap; then **Day 6**.
 
 ### Days 6–7
 
@@ -1210,7 +1340,8 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Days 5–7 remain outstanding
+Reason: Days 5–7 remain outstanding; the Day 5 gate is not met and macOS
+        cannot perform workspace cleanup
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.

@@ -4,9 +4,19 @@ use std::path::{Path, PathBuf};
 use crate::model::{DiskCapacity, DiskError};
 use crate::platform;
 
+pub use crate::platform::CapacityConfidence;
+
 /// Reports the capacity of the volume containing a given path.
 pub trait DiskProvider {
     fn capacity_for(&self, path: &Path) -> Result<DiskCapacity, DiskError>;
+
+    /// Whether the free-space figure for this volume can be trusted to decide
+    /// that a deletion was worthwhile. The default is `Confident`; only a
+    /// provider that knows better says otherwise.
+    fn capacity_confidence(&self, path: &Path) -> CapacityConfidence {
+        let _ = path;
+        CapacityConfidence::Confident
+    }
 }
 
 /// Production [`DiskProvider`] backed by the platform's native capacity
@@ -18,6 +28,10 @@ pub struct SystemDiskProvider;
 impl DiskProvider for SystemDiskProvider {
     fn capacity_for(&self, path: &Path) -> Result<DiskCapacity, DiskError> {
         platform::capacity_for(path)
+    }
+
+    fn capacity_confidence(&self, path: &Path) -> CapacityConfidence {
+        platform::capacity_confidence(path)
     }
 }
 

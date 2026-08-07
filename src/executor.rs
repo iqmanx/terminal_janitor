@@ -21,7 +21,7 @@ use crate::adapters::own_state::lock_file_path;
 use crate::adapters::pnpm::PnpmEnrolment;
 use crate::adapters::{AllowedAction, CommandRequest, CommandRunner, own_state};
 use crate::config::Config;
-use crate::disk::DiskProvider;
+use crate::disk::{CapacityConfidence, DiskProvider};
 use crate::identity::VolumeId;
 use crate::journal::{ActionOutcome, ActionState, NewAction, NewRun, RunId, RunResult};
 use crate::model::DiskError;
@@ -256,6 +256,7 @@ pub fn execute(
         succeeded: 0,
         unattempted: 0,
         command_failure: None,
+        snapshot_uncertain: false,
     };
 
     for action in &inputs.plan.actions {
@@ -332,6 +333,9 @@ struct LoopState {
     succeeded: usize,
     unattempted: usize,
     command_failure: Option<String>,
+    /// True when a workspace clean was refused because the volume's free-space
+    /// figure is not trustworthy.
+    snapshot_uncertain: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,6 +366,36 @@ fn run_one(
     state.advance_action(action_id, ActionState::Validating)?;
 
     let now = providers.clock.now();
+
+    // Where free space itself is ambiguous, a workspace clean cannot be shown
+    // to have been worthwhile, so it is refused rather than attempted
+    // (`ACCEPTANCE.md` section K). Own-state cleanup and the delegated store
+    // prune are unaffected: neither depends on that figure being exact, and
+    // neither touches a user's project.
+    if matches!(action, AllowedAction::PnpmWorkspaceClean { .. })
+        && providers.disk.capacity_confidence(inputs.volume_path)
+            == CapacityConfidence::SnapshotUncertain
+    {
+        loop_state.snapshot_uncertain = true;
+        return finish(
+            state,
+            loop_state,
+            action_id,
+            action,
+            path,
+            workspace_id,
+            free_before,
+            ActionState::SkippedUnknown,
+            Some(
+                "free space on this volume may include snapshot or purgeable \
+                 space, so a workspace clean cannot be shown to help"
+                    .to_owned(),
+            ),
+            None,
+            now,
+        );
+    }
+
     if inputs.plan.is_expired(now) {
         return finish(
             state,
@@ -624,6 +658,15 @@ fn classify(loop_state: &LoopState, target: u64) -> RunResult {
     if loop_state.free >= target {
         return RunResult::OkTargetRestored;
     }
+    // An ambiguous capacity figure is the most specific thing that went wrong,
+    // so it is reported ahead of the generic shortfall — including when the
+    // ancillary actions succeeded. Own-state cleanup and a store prune
+    // completing is not the news; the news is that workspace cleaning was
+    // blocked and the owner cannot rely on the free-space figure
+    // (`ACCEPTANCE.md` section K).
+    if loop_state.snapshot_uncertain {
+        return RunResult::SkippedSnapshotCapacityUncertain;
+    }
     if loop_state.succeeded > 0 {
         // More proven work is waiting, so this run recovered what it safely
         // could rather than exhausting the possibilities.
@@ -754,6 +797,33 @@ mod tests {
     struct StepDisk<'a> {
         volume: &'a Volume,
         failing: bool,
+        confidence: CapacityConfidence,
+    }
+
+    impl<'a> StepDisk<'a> {
+        fn new(volume: &'a Volume) -> Self {
+            Self {
+                volume,
+                failing: false,
+                confidence: CapacityConfidence::Confident,
+            }
+        }
+
+        fn failing(volume: &'a Volume) -> Self {
+            Self {
+                failing: true,
+                ..Self::new(volume)
+            }
+        }
+
+        /// Models what macOS reports: a figure that may include snapshot or
+        /// purgeable space.
+        fn snapshot_uncertain(volume: &'a Volume) -> Self {
+            Self {
+                confidence: CapacityConfidence::SnapshotUncertain,
+                ..Self::new(volume)
+            }
+        }
     }
 
     impl DiskProvider for StepDisk<'_> {
@@ -762,6 +832,10 @@ mod tests {
                 return Err(DiskError::PathNotFound(path.to_path_buf()));
             }
             DiskCapacity::new(10_000, self.volume.free.get())
+        }
+
+        fn capacity_confidence(&self, _path: &Path) -> CapacityConfidence {
+            self.confidence
         }
     }
 
@@ -1084,10 +1158,7 @@ mod tests {
         let volume = Volume {
             free: Cell::new(MINIMUM),
         };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();
 
@@ -1109,10 +1180,7 @@ mod tests {
         let volume = Volume {
             free: Cell::new(500),
         };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         // The first cleanup alone carries the volume past the target.
         let runner = FakeRunner::new(&volume, TARGET);
         let mut store = world.store();
@@ -1136,10 +1204,7 @@ mod tests {
         let volume = Volume {
             free: Cell::new(500),
         };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 100);
         let mut store = world.store();
 
@@ -1174,10 +1239,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         // Nothing recovers space, so the loop runs to exhaustion and the cap
         // on post-clean prunes is what limits them.
         let runner = FakeRunner::new(&volume, 0);
@@ -1201,10 +1263,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::failing(&volume);
         let mut store = world.store();
 
@@ -1226,10 +1285,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::erroring(&volume);
         let mut store = world.store();
 
@@ -1245,10 +1301,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();
 
@@ -1280,10 +1333,7 @@ mod tests {
         let now_active = Injected::new(&world, Liveness::Active, GitState::Clean);
         let planning = now_active.planning();
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();
 
@@ -1312,10 +1362,7 @@ mod tests {
         let now_dirty = Injected::new(&world, Liveness::Inactive, GitState::Dirty);
         let planning = now_dirty.planning();
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();
 
@@ -1338,10 +1385,7 @@ mod tests {
         plan.expires_at_millis = NOW - 1;
 
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();
 
@@ -1365,10 +1409,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: true,
-        };
+        let disk = StepDisk::failing(&volume);
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();
 
@@ -1384,10 +1425,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 300);
         let mut store = world.store();
 
@@ -1424,10 +1462,7 @@ mod tests {
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         let runner = FakeRunner::new(&volume, 10);
         let mut store = world.store();
 
@@ -1447,16 +1482,70 @@ mod tests {
     }
 
     #[test]
+    fn an_ambiguous_capacity_figure_refuses_workspace_cleans_but_not_the_rest() {
+        let world = World::new(1);
+        let injected = Injected::new(&world, Liveness::Inactive, GitState::Clean);
+        let planning = injected.planning();
+        let plan = build_plan(&world, &planning);
+        assert_eq!(plan.workspace_clean_count(), 1);
+
+        let volume = Volume { free: Cell::new(0) };
+        let disk = StepDisk::snapshot_uncertain(&volume);
+        let runner = FakeRunner::new(&volume, 0);
+        let mut store = world.store();
+
+        let report = run(&world, &plan, &planning, &disk, &runner, &mut store);
+
+        let clean = report
+            .actions
+            .iter()
+            .find(|action| action.action == "PNPM_WORKSPACE_CLEAN")
+            .expect("the clean must be journalled, not silently dropped");
+        assert_eq!(clean.state, ActionState::SkippedUnknown);
+        assert!(clean.detail.as_ref().unwrap().contains("snapshot"));
+        assert!(
+            !runner
+                .invocations()
+                .iter()
+                .any(|(args, _)| args == &["pm".to_owned(), "clean".to_owned()]),
+            "no workspace may be cleaned while free space is ambiguous"
+        );
+
+        // The delegated store prune and own-state cleanup do not depend on an
+        // exact figure and still run.
+        assert!(
+            runner
+                .invocations()
+                .iter()
+                .any(|(args, _)| args == &["store".to_owned(), "prune".to_owned()])
+        );
+        assert_eq!(report.result, RunResult::SkippedSnapshotCapacityUncertain);
+    }
+
+    #[test]
+    fn nothing_in_the_executor_can_touch_a_snapshot() {
+        // The only commands this product can issue are the compiled pnpm
+        // argument arrays, so no snapshot command is reachable by construction.
+        for action in [
+            AllowedAction::CleanTerminalJanitorState,
+            AllowedAction::PnpmStorePrune,
+        ] {
+            for argument in action.pnpm_args().unwrap_or(&[]) {
+                for forbidden in ["tmutil", "snapshot", "thin", "diskutil", "apfs"] {
+                    assert!(!argument.contains(forbidden));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exhausting_every_safe_action_reports_a_shortfall_and_no_more_authority() {
         let world = World::new(1);
         let injected = Injected::new(&world, Liveness::Inactive, GitState::Clean);
         let planning = injected.planning();
         let plan = build_plan(&world, &planning);
         let volume = Volume { free: Cell::new(0) };
-        let disk = StepDisk {
-            volume: &volume,
-            failing: false,
-        };
+        let disk = StepDisk::new(&volume);
         // Every action succeeds but frees nothing.
         let runner = FakeRunner::new(&volume, 0);
         let mut store = world.store();

@@ -25,9 +25,9 @@ use crate::executor::{
 use crate::identity::{CanonicalPath, PathIdentity, VolumeId};
 use crate::journal::{ActionState, RunRecord, RunResult};
 use crate::planner::{
-    GitProver, Plan, PlanningInputs, PlanningProviders, UnavailableGitProver,
-    UnavailableLivenessProver, plan,
+    GitProver, Plan, PlanningInputs, PlanningProviders, UnavailableGitProver, plan,
 };
+use crate::process::{ProcessLivenessProver, SystemProcessProvider};
 use crate::protection::{DeniedRoots, SystemProtectionProbe};
 use crate::state::{
     Clock, CoordinatedWriteError, GitState, ScanStateResult, SqliteStateStore, StateError,
@@ -594,11 +594,13 @@ fn build_plans(
     };
     let protection_probe = SystemProtectionProbe;
     let denied_roots = DeniedRoots::from_user_directories();
+    let process_provider = SystemProcessProvider;
+    let liveness = ProcessLivenessProver::new(&process_provider);
     let providers = PlanningProviders {
         discovery: provider,
         protection_probe: &protection_probe,
         denied_roots: &denied_roots,
-        liveness: &UnavailableLivenessProver,
+        liveness: &liveness,
         git: git_prover.as_ref(),
     };
 
@@ -671,11 +673,13 @@ pub fn check(
     };
     let protection_probe = SystemProtectionProbe;
     let denied_roots = DeniedRoots::from_user_directories();
+    let process_provider = SystemProcessProvider;
+    let liveness = ProcessLivenessProver::new(&process_provider);
     let providers = PlanningProviders {
         discovery: &SystemDiscoveryProvider,
         protection_probe: &protection_probe,
         denied_roots: &denied_roots,
-        liveness: &UnavailableLivenessProver,
+        liveness: &liveness,
         git: git_prover.as_ref(),
     };
 

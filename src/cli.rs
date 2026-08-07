@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use crate::adapters::SystemCommandRunner;
 use crate::config::{ConfigError, load_config_at};
 use crate::disk::DiskProvider;
 use crate::executor::RunReport;
 use crate::model::DiskError;
+use crate::scheduler::{ScheduleContext, ScheduleReport, disable, enable};
 use crate::status::{StorageStatus, render_human, render_json};
 use crate::workflows::{
     HistoryReport, InitOptions, InitReport, ProtectionListReport, ProtectionReport, ScanReport,
@@ -74,6 +76,10 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Install the hourly per-user schedule
+    Enable,
+    /// Remove the per-user schedule
+    Disable,
 }
 
 #[derive(Debug, Subcommand)]
@@ -136,6 +142,37 @@ pub fn execute_check(
             }
         }
         Err(error) => workflow_failure(json, &error),
+    }
+}
+
+/// Installs or removes the per-user schedule. Both are idempotent, so a
+/// repeated call is not an error.
+pub fn execute_schedule(json: bool, enable_schedule: bool) -> CommandOutput {
+    let context = match ScheduleContext::resolve() {
+        Ok(context) => context,
+        Err(error) => {
+            return render_failure(
+                json,
+                "FAILED_CONFIGURATION",
+                &error,
+                EXIT_FAILED_CONFIGURATION,
+            );
+        }
+    };
+    let runner = SystemCommandRunner;
+    let outcome = if enable_schedule {
+        enable(&context, &runner)
+    } else {
+        disable(&context, &runner)
+    };
+    match outcome {
+        Ok(report) => render_serializable(json, &report, render_schedule_human(&report)),
+        Err(error) => render_failure(
+            json,
+            "FAILED_CONFIGURATION",
+            &error,
+            EXIT_FAILED_CONFIGURATION,
+        ),
     }
 }
 
@@ -506,6 +543,24 @@ fn render_history_human(report: &HistoryReport) -> String {
     output
 }
 
+fn render_schedule_human(report: &ScheduleReport) -> String {
+    let mut output = format!("{}\nMechanism: {}\n", report.result, report.mechanism);
+    if let Some(binary) = &report.binary {
+        output.push_str(&format!(
+            "Runs: {} check\nEvery: hourly\n",
+            binary.display()
+        ));
+    }
+    for file in &report.files {
+        output.push_str(&format!("{}\n", file.display()));
+    }
+    if let Some(detail) = &report.detail {
+        output.push_str(&format!("{detail}\n"));
+    }
+    output.push_str("No administrator rights were requested.\n");
+    output
+}
+
 fn render_protection_human(report: &ProtectionReport) -> String {
     format!(
         "{}\nWorkspace: {}\nProtected: {}\n",
@@ -558,12 +613,8 @@ mod tests {
         ] {
             assert!(help.contains(command), "{command} must be listed");
         }
-        // Scheduling is Day 5; it must not be advertised before it exists.
-        for later in ["enable", "disable"] {
-            assert!(
-                !help.contains(&format!("\n  {later}")),
-                "{later} must not be listed yet"
-            );
+        for scheduling in ["enable", "disable"] {
+            assert!(help.contains(scheduling), "{scheduling} must be listed");
         }
 
         let version = Cli::try_parse_from(["terminal_janitor", "--version"]).unwrap_err();

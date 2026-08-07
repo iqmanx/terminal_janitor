@@ -40,18 +40,11 @@ fn help_lists_the_implemented_commands_and_no_later_ones() {
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
     for implemented in [
-        "init", "scan", "protect", "status", "check", "clean", "history",
+        "init", "scan", "protect", "status", "check", "clean", "history", "enable", "disable",
     ] {
         assert!(
             stdout.contains(&format!("  {implemented}")),
             "{implemented} must be listed"
-        );
-    }
-    // Scheduling is Day 5 and must not appear before it exists.
-    for later_command in ["enable", "disable"] {
-        assert!(
-            !stdout.contains(&format!("  {later_command}")),
-            "{later_command} must not be listed yet"
         );
     }
 }

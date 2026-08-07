@@ -59,7 +59,7 @@ README.md
 
 No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
 
-## Current CLI (Day 4)
+## Current CLI (Day 5)
 
 ```text
 terminal_janitor init --root <path> [--root <path> ...] [--pnpm <path>]
@@ -74,6 +74,8 @@ terminal_janitor status --json
 terminal_janitor check
 terminal_janitor clean
 terminal_janitor history [--limit <n>]
+terminal_janitor enable
+terminal_janitor disable
 ```
 
 `--json` and `--dry-run` are global. `--dry-run` reads and reports without
@@ -139,9 +141,28 @@ directly with no shell. Empty output is clean; any line is dirty; a missing
 Git, a non-zero exit, a timeout, or truncated output is `unknown`, and unknown
 skips.
 
-Process liveness is Day 5 work. Until it exists the production prover answers
-`unknown` for every workspace, so a real machine plans no workspace clean at
-all. That is deliberate: an unfinished gate refuses rather than passes.
+Process liveness is now proven rather than assumed. A process whose working
+directory is inside the workspace, or whose command names it, makes the
+workspace active. A failed enumeration is unknown. So is an unreadable working
+directory when the process belongs to this user, or when it is a package
+manager or Node whoever owns it — those are exactly the processes that would be
+working in a workspace. Another user's unreadable daemon does not block a
+clean, because a per-user tool cannot inspect it and treating that as
+uncertainty would mean never cleaning anything.
+
+`enable` installs an hourly per-user schedule and `disable` removes it. Linux
+uses a systemd user timer, macOS a LaunchAgent, Windows a per-user scheduled
+task. Each names the canonicalised installed binary and runs `check` as a bare
+argument: no shell, no pipeline, and no administrator rights are ever
+requested. Both commands are idempotent, including disabling something that was
+never installed.
+
+**macOS cannot currently clean a workspace.** On APFS the reported free space
+can include purgeable space and space held by Time Machine local snapshots, and
+this product has no snapshot-aware measurement. Unresolved ambiguity must block
+workspace cleaning rather than be guessed at, so macOS runs report
+`SKIPPED_SNAPSHOT_CAPACITY_UNCERTAIN` and perform own-state cleanup and store
+pruning only. `terminal_janitor` never deletes or thins a snapshot.
 
 The observation ledger records marker modification time plus bounded Git HEAD
 and index fingerprints. It does not use filesystem access time. The stored
@@ -342,16 +363,16 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 Days 1 through 3 are complete, each closed by CI green on Ubuntu, macOS, and
 Windows.
 
-Day 4 adds the verified executor: the per-volume lock, the run and action
+Day 4 added the verified executor: the per-volume lock, the run and action
 journal, direct execution with compiled argument arrays, pre-action proof and
 identity revalidation, measurement after every action, stop-at-target, the
 safe-shortfall result, the two-workspace cap, own-state cleanup, the one
-permitted post-clean store prune, and the `check`, `clean`, and `history`
-commands.
+permitted post-clean store prune, and `check`, `clean`, and `history`.
 
-Cleanup can now run, but not on a real machine yet: process enumeration is Day
-5, so the production liveness prover answers `unknown` and no workspace clean
-is ever planned. A real `check` under pressure will run own-state cleanup and
-delegate a store prune, then report a shortfall. Scheduling does not exist;
-that is Day 5. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for
-the exact handover state.
+Day 5 adds real process liveness, native per-user scheduling, and the macOS
+capacity rule. Its gate is **not** met: `PLANS.md` requires enabling,
+triggering, and disabling the schedule on real Linux, macOS, and Windows
+machines, and none of that has been performed. macOS also cannot clean a
+workspace until snapshot-aware capacity measurement exists. Both are recorded
+as blockers. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the
+exact handover state.

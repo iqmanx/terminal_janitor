@@ -36,6 +36,38 @@ pub fn capacity_for(path: &Path) -> Result<DiskCapacity, DiskError> {
     }
 }
 
+/// How far a free-space figure for this volume can be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityConfidence {
+    /// The reported free space is what a caller would actually get.
+    Confident,
+    /// The figure may include space the operating system holds in snapshots or
+    /// counts as purgeable, so it cannot be relied on to decide that deleting
+    /// something was worthwhile.
+    SnapshotUncertain,
+}
+
+/// Reports whether free space on the volume containing `path` is unambiguous.
+///
+/// macOS is the reason this exists. On APFS the reported available figure can
+/// include purgeable space and space held by Time Machine local snapshots, and
+/// this product has no snapshot-aware measurement. `ACCEPTANCE.md` section K
+/// requires that unresolved ambiguity block workspace cleaning rather than be
+/// guessed at, so macOS reports `SnapshotUncertain` and the executor refuses
+/// workspace cleans there. `terminal_janitor` never deletes or thins a
+/// snapshot under any circumstances.
+pub fn capacity_confidence(path: &Path) -> CapacityConfidence {
+    let _ = path;
+    #[cfg(target_os = "macos")]
+    {
+        CapacityConfidence::SnapshotUncertain
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CapacityConfidence::Confident
+    }
+}
+
 /// Best-available native identity for the volume containing `path` and for
 /// the file or directory itself, as `(volume, file)` opaque strings.
 ///

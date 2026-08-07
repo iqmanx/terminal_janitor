@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use terminal_janitor::cli::{
     Cli, Command, CommandOutput, configuration_path_failure, execute_check, execute_history,
-    execute_init, execute_protection, execute_scan, execute_status, render_failure,
-    storage_path_failure,
+    execute_init, execute_protection, execute_scan, execute_schedule, execute_status,
+    render_failure, storage_path_failure,
 };
 use terminal_janitor::config::config_file_path;
 use terminal_janitor::disk::SystemDiskProvider;
@@ -37,6 +37,8 @@ fn main() -> ExitCode {
         // `clean` deliberately shares every line of `check`'s authority.
         Command::Check | Command::Clean => run_check(json, dry_run),
         Command::History { limit } => run_history(json, limit),
+        Command::Enable => execute_schedule(json, true),
+        Command::Disable => execute_schedule(json, false),
     };
     emit(output)
 }

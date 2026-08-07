@@ -20,6 +20,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # Stable machine-readable output and strict TOML configuration loading.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 # Same-directory temporary files for atomic configuration replacement, and
 # isolated auto-cleaned fixture directories in tests.
 tempfile = "3"
