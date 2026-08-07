@@ -30,6 +30,9 @@ pub struct Cli {
     /// Emit stable machine-readable JSON
     #[arg(long, global = true)]
     pub json: bool,
+    /// Read and report without writing state
+    #[arg(long, global = true)]
+    pub dry_run: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -47,6 +50,9 @@ pub enum Command {
         /// Recovery target threshold (for example 15GiB)
         #[arg(long)]
         target_free: Option<String>,
+        /// Pnpm executable to enrol; PATH is searched when this is omitted
+        #[arg(long)]
+        pnpm: Option<PathBuf>,
     },
     /// Discover pnpm workspaces read-only beneath approved roots
     Scan,
@@ -88,8 +94,13 @@ pub fn execute_init(
     }
 }
 
-pub fn execute_scan(json: bool, config_path: &Path, state_path: &Path) -> CommandOutput {
-    match scan(config_path, state_path) {
+pub fn execute_scan(
+    json: bool,
+    config_path: &Path,
+    state_path: &Path,
+    dry_run: bool,
+) -> CommandOutput {
+    match scan(config_path, state_path, dry_run) {
         Ok(report) => render_serializable(json, &report, render_scan_human(&report)),
         Err(error) => workflow_failure(json, &error),
     }
@@ -260,7 +271,49 @@ fn render_init_human(report: &InitReport) -> String {
     for root in &report.approved_roots {
         output.push_str(&format!("{}\n", root.display()));
     }
+    match (&report.pnpm_path, &report.pnpm_version) {
+        (Some(path), Some(version)) => {
+            output.push_str(&format!("Enrolled pnpm: {} ({version})\n", path.display()))
+        }
+        _ => output.push_str("Enrolled pnpm: none\n"),
+    }
+    if let Some(note) = &report.pnpm_note {
+        output.push_str(&format!("{note}\n"));
+    }
     output.push_str("Scheduling was not enabled. Scan was not run.\n");
+    output
+}
+
+fn render_plans_human(report: &ScanReport) -> String {
+    let mut output = String::new();
+    for plan in &report.plans {
+        output.push_str(&format!(
+            "\nPlan {} (policy {})\nActions: {}\n",
+            plan.plan_id,
+            plan.policy_hash,
+            plan.actions.len()
+        ));
+        for action in &plan.actions {
+            match &action.path {
+                Some(path) => {
+                    output.push_str(&format!("{} {}\n", action.action, path.display()));
+                }
+                None => output.push_str(&format!("{}\n", action.action)),
+            }
+        }
+        if !plan.skipped.is_empty() {
+            output.push_str("Skipped\n");
+            for skipped in &plan.skipped {
+                output.push_str(&format!(
+                    "{}\nGate: {} — {}\n",
+                    skipped.path.display(),
+                    skipped.gate,
+                    skipped.reason
+                ));
+            }
+        }
+    }
+    output.push_str("\nNothing was cleaned. Planning does not execute.\n");
     output
 }
 
@@ -330,6 +383,10 @@ fn render_scan_human(report: &ScanReport) -> String {
             output.push_str(&format!("{}\n", workspace.path.display()));
         }
     }
+    if report.dry_run {
+        output.push_str("\nDry run: no observation was written to the ledger.\n");
+    }
+    output.push_str(&render_plans_human(report));
     output.push_str("\nNo cleanup was performed.\n");
     output
 }
@@ -362,6 +419,10 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
+
+    /// A path that cannot exist, so these tests never search `PATH` for pnpm
+    /// and never run a real one.
+    const ABSENT_PNPM: &str = "/terminal_janitor-test-no-such-pnpm";
     use crate::disk::FakeDiskProvider;
     use crate::model::DiskCapacity;
 
@@ -470,6 +531,7 @@ mod tests {
                 roots: vec![],
                 minimum_free: None,
                 target_free: None,
+                pnpm: Some(PathBuf::from(ABSENT_PNPM)),
             },
         );
         assert_eq!(missing_root.exit_code, EXIT_FAILED_ROOT_VALIDATION);
@@ -484,6 +546,7 @@ mod tests {
                 roots: vec![root],
                 minimum_free: None,
                 target_free: None,
+                pnpm: Some(PathBuf::from(ABSENT_PNPM)),
             },
         );
         assert_eq!(init.exit_code, EXIT_SUCCESS);
@@ -491,7 +554,7 @@ mod tests {
         assert!(init.stdout.contains("Scheduling was not enabled"));
         assert!(init.stdout.contains("Scan was not run"));
 
-        let scan = execute_scan(false, &config, &state);
+        let scan = execute_scan(false, &config, &state, false);
         assert_eq!(scan.exit_code, EXIT_SUCCESS);
         assert!(scan.stdout.contains("Workspace scan"));
         assert!(scan.stdout.contains("Workspaces registered: 1"));

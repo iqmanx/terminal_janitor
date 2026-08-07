@@ -7,13 +7,16 @@
 //! planning, pnpm execution, project mutation, or scheduling.
 
 pub mod activity;
+pub mod adapters;
 pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod disk;
 pub mod identity;
 pub mod model;
+pub mod planner;
 mod platform;
+pub mod protection;
 pub mod state;
 pub mod status;
 pub mod workflows;

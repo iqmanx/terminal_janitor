@@ -9,6 +9,8 @@ use directories::ProjectDirs;
 use serde::Serialize;
 
 use crate::activity::{ActivityProbe, SystemActivityProbe};
+use crate::adapters::pnpm::PnpmEnrolment;
+use crate::adapters::{CommandRunner, SystemCommandRunner, git, pnpm};
 use crate::config::{
     Config, ConfigError, LoadedConfig, load_config_at, parse_size, save_config_at,
 };
@@ -16,10 +18,15 @@ use crate::discovery::{
     DiscoveryProvider, ExcludedPath, ExclusionReason, SystemDiscoveryProvider, UnavailableRoot,
     discover,
 };
-use crate::identity::{CanonicalPath, PathIdentity};
+use crate::identity::{CanonicalPath, PathIdentity, VolumeId};
+use crate::planner::{
+    GitProver, Plan, PlanningInputs, PlanningProviders, UnavailableGitProver,
+    UnavailableLivenessProver, plan,
+};
+use crate::protection::{DeniedRoots, SystemProtectionProbe};
 use crate::state::{
-    CoordinatedWriteError, GitState, ScanStateResult, SqliteStateStore, StateError, StateStore,
-    WorkspaceChangeKind, WorkspaceRecord, WorkspaceStatus,
+    Clock, CoordinatedWriteError, GitState, ScanStateResult, SqliteStateStore, StateError,
+    StateStore, SystemClock, WorkspaceChangeKind, WorkspaceRecord, WorkspaceStatus,
 };
 
 pub const STATE_FILE_NAME: &str = "state.sqlite3";
@@ -69,11 +76,14 @@ impl From<StateError> for WorkflowError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InitOptions {
     pub roots: Vec<PathBuf>,
     pub minimum_free: Option<String>,
     pub target_free: Option<String>,
+    /// Explicit pnpm executable to enrol. When absent, `PATH` is searched once
+    /// and whatever it finds is enrolled by canonical identity.
+    pub pnpm: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,6 +94,13 @@ pub struct InitReport {
     pub target_free_bytes: u64,
     pub scheduling_enabled: bool,
     pub scan_performed: bool,
+    /// Enrolment outcome. A machine without pnpm still initialises: pnpm is
+    /// required only when a pnpm action is actually used (`ACCEPTANCE.md`
+    /// section A), so a failure here is reported, not fatal.
+    pub pnpm_enrolled: bool,
+    pub pnpm_path: Option<PathBuf>,
+    pub pnpm_version: Option<String>,
+    pub pnpm_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -125,6 +142,13 @@ pub struct ScanReport {
     pub missing: Vec<WorkspaceSummary>,
     pub protected_workspaces: usize,
     pub cleanup_performed: bool,
+    /// True when `--dry-run` kept the observation out of the ledger.
+    pub dry_run: bool,
+    /// One plan per volume that holds registered workspaces, ordered by volume
+    /// identity. Scan is not a pressure-driven run, so each volume is planned
+    /// as though it were the pressured one: the plan answers "if this volume
+    /// needed space, what could be done and what exactly would refuse".
+    pub plans: Vec<Plan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,20 +186,45 @@ pub fn initialise_with_provider(
     options: InitOptions,
     provider: &dyn DiscoveryProvider,
 ) -> Result<InitReport, WorkflowError> {
+    initialise_with(
+        config_path,
+        state_path,
+        options,
+        provider,
+        &SystemCommandRunner,
+        &SystemClock,
+    )
+}
+
+/// Registration with every external interface injected, so tests never depend
+/// on a real pnpm, a real clock, or the real `PATH`.
+pub fn initialise_with(
+    config_path: &Path,
+    state_path: &Path,
+    options: InitOptions,
+    provider: &dyn DiscoveryProvider,
+    runner: &dyn CommandRunner,
+    clock: &dyn Clock,
+) -> Result<InitReport, WorkflowError> {
     initialise_with_provider_and_writer(
         config_path,
         state_path,
         options,
         provider,
+        runner,
+        clock,
         &|path, config| save_config_at(path, config),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialise_with_provider_and_writer(
     config_path: &Path,
     state_path: &Path,
     options: InitOptions,
     provider: &dyn DiscoveryProvider,
+    runner: &dyn CommandRunner,
+    clock: &dyn Clock,
     config_writer: &dyn Fn(&Path, &Config) -> Result<(), ConfigError>,
 ) -> Result<InitReport, WorkflowError> {
     if options.roots.is_empty() {
@@ -255,6 +304,35 @@ fn initialise_with_provider_and_writer(
         }
     };
 
+    // Enrolment happens after registration succeeds, and its failure never
+    // undoes registration: approved roots are the owner's decision, while a
+    // missing or too-old pnpm only means no pnpm action can be planned yet.
+    let mut pnpm_enrolled = false;
+    let mut pnpm_path = None;
+    let mut pnpm_version = None;
+    let mut pnpm_note = None;
+    match options.pnpm.or_else(pnpm::locate_on_path) {
+        Some(path) => match pnpm::enrol(&path, runner, clock) {
+            Ok(enrolment) => {
+                state.set_pnpm_enrolment(&enrolment.to_record())?;
+                pnpm_enrolled = true;
+                pnpm_path = Some(enrolment.identity.canonical.as_path().to_path_buf());
+                pnpm_version = Some(enrolment.version.as_str().to_owned());
+            }
+            // A refused executable never becomes an enrolment, and it never
+            // undoes root registration either. The refusal is reported so the
+            // owner can see that no pnpm action can be planned yet.
+            Err(error) => pnpm_note = Some(format!("pnpm was not enrolled: {error}")),
+        },
+        None => {
+            pnpm_note = Some(
+                "no pnpm executable was found on PATH; \
+                 enrol one with init --pnpm <path> before pnpm actions can be planned"
+                    .to_owned(),
+            );
+        }
+    }
+
     Ok(InitReport {
         result: "INIT_COMPLETE",
         approved_roots: records
@@ -265,6 +343,10 @@ fn initialise_with_provider_and_writer(
         target_free_bytes: next.target_free_bytes,
         scheduling_enabled: false,
         scan_performed: false,
+        pnpm_enrolled,
+        pnpm_path,
+        pnpm_version,
+        pnpm_note,
     })
 }
 
@@ -329,12 +411,17 @@ fn restore_config(config_path: &Path, existed: bool, previous: &Config) -> Resul
     }
 }
 
-pub fn scan(config_path: &Path, state_path: &Path) -> Result<ScanReport, WorkflowError> {
+pub fn scan(
+    config_path: &Path,
+    state_path: &Path,
+    dry_run: bool,
+) -> Result<ScanReport, WorkflowError> {
     scan_with(
         config_path,
         state_path,
         &SystemDiscoveryProvider,
         &SystemActivityProbe,
+        dry_run,
     )
 }
 
@@ -343,6 +430,7 @@ pub fn scan_with(
     state_path: &Path,
     provider: &dyn DiscoveryProvider,
     activity: &dyn ActivityProbe,
+    dry_run: bool,
 ) -> Result<ScanReport, WorkflowError> {
     let loaded = load_config_at(config_path)?;
     if loaded.config.approved_roots.is_empty() {
@@ -408,11 +496,20 @@ pub fn scan_with(
         })
         .map(|excluded| excluded.path.clone())
         .collect();
-    let ScanStateResult { changes, missing } = state.apply_scan(
-        &discovery.validated_roots,
-        &discovery.observations,
-        &uncertain_prefixes,
-    )?;
+    // A dry run reads everything and writes nothing, so the ledger's first
+    // observation timestamps are not advanced by a rehearsal.
+    let ScanStateResult { changes, missing } = if dry_run {
+        ScanStateResult {
+            changes: Vec::new(),
+            missing: Vec::new(),
+        }
+    } else {
+        state.apply_scan(
+            &discovery.validated_roots,
+            &discovery.observations,
+            &uncertain_prefixes,
+        )?
+    };
     let mut registered = Vec::new();
     let mut updated = Vec::new();
     for change in changes {
@@ -436,6 +533,8 @@ pub fn scan_with(
     } else {
         "SCAN_COMPLETE_WITH_EXCLUSIONS"
     };
+    let plans = build_plans(&state, &loaded.config, provider)?;
+
     Ok(ScanReport {
         result,
         approved_roots: discovery.approved_roots,
@@ -447,7 +546,81 @@ pub fn scan_with(
         missing,
         protected_workspaces,
         cleanup_performed: false,
+        dry_run,
+        plans,
     })
+}
+
+/// Asks Git, read-only, through the enrolled command interface.
+struct CommandGitProver<'a> {
+    git: PathBuf,
+    runner: &'a dyn CommandRunner,
+}
+
+impl GitProver for CommandGitProver<'_> {
+    fn worktree_state(&self, workspace: &Path) -> GitState {
+        git::worktree_state(workspace, &self.git, self.runner)
+    }
+}
+
+/// Builds one plan per volume holding registered workspaces.
+///
+/// Planning writes nothing and executes no cleanup command. The only child
+/// process involved is the read-only `git status` query.
+fn build_plans(
+    state: &SqliteStateStore,
+    config: &Config,
+    provider: &dyn DiscoveryProvider,
+) -> Result<Vec<Plan>, WorkflowError> {
+    let workspaces = state.list_workspaces()?;
+    let roots = state.list_approved_roots()?;
+    let enrolment = state
+        .get_pnpm_enrolment()?
+        .as_ref()
+        .and_then(|record| PnpmEnrolment::from_record(record).ok());
+
+    let runner = SystemCommandRunner;
+    let git_prover: Box<dyn GitProver> = match git::locate_on_path() {
+        Some(git) => Box::new(CommandGitProver {
+            git,
+            runner: &runner,
+        }),
+        None => Box::new(UnavailableGitProver),
+    };
+    let protection_probe = SystemProtectionProbe;
+    let denied_roots = DeniedRoots::from_user_directories();
+    let providers = PlanningProviders {
+        discovery: provider,
+        protection_probe: &protection_probe,
+        denied_roots: &denied_roots,
+        liveness: &UnavailableLivenessProver,
+        git: git_prover.as_ref(),
+    };
+
+    let mut volumes: Vec<VolumeId> = workspaces
+        .iter()
+        .map(|workspace| workspace.volume_id.clone())
+        .collect();
+    volumes.sort();
+    volumes.dedup();
+
+    let now = SystemClock.now();
+    Ok(volumes
+        .iter()
+        .map(|volume| {
+            plan(
+                &PlanningInputs {
+                    workspaces: &workspaces,
+                    approved_roots: &roots,
+                    pnpm: enrolment.as_ref(),
+                    pressured_volume: volume,
+                    config,
+                    now,
+                },
+                &providers,
+            )
+        })
+        .collect())
 }
 
 pub fn set_protection(
@@ -565,6 +738,45 @@ mod tests {
     use crate::identity::{FileId, VolumeId};
     use crate::state::{NewApprovedRoot, StateStore};
 
+    /// A path that cannot exist. Naming it explicitly keeps registration tests
+    /// off `PATH` entirely, so they neither find nor run a real pnpm.
+    const ABSENT_PNPM: &str = "/terminal_janitor-test-no-such-pnpm";
+
+    /// Answers every command with one fixed outcome and records what was asked.
+    struct FakeRunner {
+        stdout: String,
+        exit_code: i32,
+        requests: std::cell::RefCell<Vec<(PathBuf, Vec<String>)>>,
+    }
+
+    impl FakeRunner {
+        fn version(stdout: &str) -> Self {
+            Self {
+                stdout: stdout.to_owned(),
+                exit_code: 0,
+                requests: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(
+            &self,
+            request: &crate::adapters::CommandRequest<'_>,
+        ) -> Result<crate::adapters::CommandOutcome, crate::adapters::CommandError> {
+            self.requests.borrow_mut().push((
+                request.program.to_path_buf(),
+                request.args.iter().map(|arg| (*arg).to_owned()).collect(),
+            ));
+            Ok(crate::adapters::CommandOutcome {
+                exit_code: Some(self.exit_code),
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+                output_truncated: false,
+            })
+        }
+    }
+
     fn paths(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
         (
             dir.path().join("config/config.toml"),
@@ -577,6 +789,7 @@ mod tests {
             roots: vec![root.to_path_buf()],
             minimum_free: None,
             target_free: None,
+            pnpm: Some(PathBuf::from(ABSENT_PNPM)),
         }
     }
 
@@ -599,6 +812,7 @@ mod tests {
                     roots: vec![],
                     minimum_free: None,
                     target_free: None,
+                    pnpm: Some(PathBuf::from(ABSENT_PNPM)),
                 }
             ),
             Err(WorkflowError::RootValidation { .. })
@@ -640,6 +854,7 @@ mod tests {
                 roots: vec![root.clone(), root.clone()],
                 minimum_free: Some("2GiB".to_owned()),
                 target_free: Some("3GiB".to_owned()),
+                pnpm: Some(PathBuf::from(ABSENT_PNPM)),
             },
         )
         .unwrap();
@@ -674,6 +889,7 @@ mod tests {
                 roots: vec![root],
                 minimum_free: Some("20GiB".to_owned()),
                 target_free: Some("10GiB".to_owned()),
+                pnpm: Some(PathBuf::from(ABSENT_PNPM)),
             },
         )
         .unwrap_err();
@@ -703,6 +919,8 @@ mod tests {
             &state,
             options(&root),
             &SystemDiscoveryProvider,
+            &FakeRunner::version("11.2.3"),
+            &crate::state::FixedClock::new(0),
             &|path, _| {
                 Err(ConfigError::Write {
                     path: path.to_path_buf(),
@@ -749,7 +967,7 @@ mod tests {
         let (config, state) = paths(&dir);
         initialise(&config, &state, options(&root)).unwrap();
 
-        let first = scan(&config, &state).unwrap();
+        let first = scan(&config, &state, false).unwrap();
         assert_eq!(first.registered.len(), 1);
         assert!(first.updated.is_empty());
         assert!(!first.cleanup_performed);
@@ -761,7 +979,7 @@ mod tests {
         let protected_again = set_protection(&state, &original, true).unwrap();
         assert!(protected_again.workspace.protected);
         assert_eq!(list_protection(&state).unwrap().protected.len(), 1);
-        let repeated = scan(&config, &state).unwrap();
+        let repeated = scan(&config, &state, false).unwrap();
         assert_eq!(repeated.updated.len(), 1);
         assert_eq!(repeated.updated[0].id, original_id);
         assert_eq!(repeated.updated[0].first_observed_at, first_observed);
@@ -769,7 +987,7 @@ mod tests {
 
         let moved = root.join("moved workspace");
         fs::rename(&original, &moved).unwrap();
-        let moved_scan = scan(&config, &state).unwrap();
+        let moved_scan = scan(&config, &state, false).unwrap();
         assert_eq!(moved_scan.registered.len(), 1);
         assert_ne!(moved_scan.registered[0].id, original_id);
         assert!(!moved_scan.registered[0].protected);
@@ -801,7 +1019,7 @@ mod tests {
         initialise(&config, &state, options(&root)).unwrap();
         fs::remove_dir(&root).unwrap();
 
-        let report = scan(&config, &state).unwrap();
+        let report = scan(&config, &state, false).unwrap();
         assert_eq!(report.approved_roots, 1);
         assert_eq!(report.roots_scanned, 0);
         assert_eq!(report.unavailable_roots.len(), 1);
@@ -828,7 +1046,7 @@ mod tests {
             set_protection(&state, &root, true),
             Err(WorkflowError::UnknownWorkspace { .. })
         ));
-        let report = scan(&config, &state).unwrap();
+        let report = scan(&config, &state, false).unwrap();
         serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&report).unwrap())
             .unwrap();
     }

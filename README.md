@@ -59,18 +59,22 @@ README.md
 
 No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
 
-## Current CLI (Day 2)
+## Current CLI (Day 3)
 
 ```text
-terminal_janitor init --root <path> [--root <path> ...]
+terminal_janitor init --root <path> [--root <path> ...] [--pnpm <path>]
 terminal_janitor scan
 terminal_janitor scan --json
+terminal_janitor scan --dry-run
 terminal_janitor protect add <path>
 terminal_janitor protect remove <path>
 terminal_janitor protect list
 terminal_janitor status
 terminal_janitor status --json
 ```
+
+`--json` and `--dry-run` are global. `--dry-run` reads and reports without
+writing state, so a rehearsal never advances the ledger's observation history.
 
 `init` requires at least one explicit `--root`; it never guesses the home
 directory or a conventional projects directory. Optional `--minimum-free` and
@@ -80,6 +84,17 @@ file identity, and written to configuration and state as one coordinated
 transaction. Filesystem roots/whole system drives and root paths whose final
 component is a symbolic link are rejected. Repeating the same registration is
 idempotent. `init` neither scans nor enables scheduling.
+
+`init` also enrols one pnpm executable. `--pnpm <path>` names it explicitly;
+without that flag `PATH` is searched once. What is stored is the canonical
+path plus the executable's native volume and file identity, so later runs
+prove the same file is still there instead of trusting `PATH` again. The only
+command enrolment runs is `pnpm --version`, and pnpm major version 11 is the
+minimum. An `npm`-installed Windows wrapper (`pnpm.cmd`, `pnpm.bat`,
+`pnpm.ps1`) is refused, because running one would place `cmd.exe` or
+PowerShell between this product and pnpm; enrol the pnpm executable itself.
+A machine with no usable pnpm still initialises — the outcome is reported and
+no pnpm action can be planned until one is enrolled.
 
 `scan` is explicitly invoked and entirely read-only with respect to projects.
 It scans only registered approved roots, invokes neither pnpm nor another
@@ -104,10 +119,32 @@ identity changes, disappearing paths, partial workspace markers, and
 unavailable roots are reported with stable exact reasons rather than treated
 as absence.
 
+`scan` also builds a plan and prints it. Planning decides; it never executes.
+Every registered workspace ends in one of exactly two states: eligible with a
+complete proof bundle, or skipped with one exact gate name and one reason.
+Gates run in a fixed order — registration status, approved-root ownership,
+live identity revalidation, pressured volume, protection, the three pnpm
+markers, pnpm enrolment and version, Git worktree cleanliness, the 24-hour
+observation window, the 30-day inactivity window, the 7-day cooldown, then
+process liveness — and the first refusal is the one reported. Plans carry an
+immutable plan ID, a policy hash, and a 15-minute expiry, and no plan may
+contain more than two workspace cleans.
+
+Day 3 asks Git for worktree state with a fixed read-only argument array
+(`git --no-optional-locks status --porcelain=v1 --untracked-files=all`), run
+directly with no shell. Empty output is clean; any line is dirty; a missing
+Git, a non-zero exit, a timeout, or truncated output is `unknown`, and unknown
+skips.
+
+Process liveness is Day 5 work. Until it exists the production prover answers
+`unknown` for every workspace, so a real machine plans no workspace clean at
+all. That is deliberate: an unfinished gate refuses rather than passes.
+
 The observation ledger records marker modification time plus bounded Git HEAD
-and index fingerprints. It does not use filesystem access time. Git worktree
-state remains explicitly `unknown` in Day 2 because no Git process or shell is
-invoked. Activity may move forward but never backwards; first observation and
+and index fingerprints. It does not use filesystem access time. The stored
+`git_state` on a workspace record remains `unknown`, because the ledger holds
+only what read-only filesystem observation established; worktree cleanliness is
+proven at planning time and is never persisted as authority. Activity may move forward but never backwards; first observation and
 protection remain stable. Missing workspaces remain in state, including their
 protection, and a moved workspace receives a new identity and fresh history.
 
@@ -179,9 +216,53 @@ observation timestamps):
   "unavailable_roots": [],
   "missing": [],
   "protected_workspaces": 0,
-  "cleanup_performed": false
+  "cleanup_performed": false,
+  "dry_run": false,
+  "plans": [
+    {
+      "plan_id": "plan-fnv1a64:…",
+      "policy_hash": "policy-fnv1a64:…",
+      "created_at_millis": 0,
+      "expires_at_millis": 900000,
+      "actions": [
+        {
+          "action": "CLEAN_TERMINAL_JANITOR_STATE",
+          "proof": {
+            "action_allowlisted": true,
+            "owner_proven": true,
+            "regenerability_proven": true,
+            "reference_safety_proven": true,
+            "inactivity_proven": true,
+            "protection_checks_passed": true,
+            "executable_identity_verified": true,
+            "target_identity_verified": true
+          }
+        }
+      ],
+      "skipped": [
+        {
+          "workspace_id": "…",
+          "path": "/approved/projects/api",
+          "gate": "OBSERVATION_WINDOW_NOT_MET",
+          "reason": "observed for 0 of the required 24 hours"
+        }
+      ]
+    }
+  ]
 }
 ```
+
+One plan is emitted per volume holding registered workspaces, ordered by
+volume identity. Stable gate names are `NOT_INSIDE_APPROVED_ROOT`,
+`WORKSPACE_NOT_PRESENT`, `TARGET_IDENTITY_CHANGED`, `DIFFERENT_VOLUME`,
+`PROTECTED`, `MISSING_MARKER`, `PNPM_NOT_ENROLLED`, `PNPM_IDENTITY_CHANGED`,
+`PNPM_BELOW_MINIMUM_VERSION`, `GIT_STATE_UNKNOWN`, `GIT_WORKTREE_DIRTY`,
+`OBSERVATION_WINDOW_NOT_MET`, `RECENT_ACTIVITY`, `COOLDOWN_ACTIVE`,
+`WORKSPACE_ACTIVE`, `LIVENESS_UNKNOWN`, and
+`AUTOMATIC_WORKSPACE_CAP_REACHED`. Action names are
+`CLEAN_TERMINAL_JANITOR_STATE`, `PNPM_STORE_PRUNE`, and
+`PNPM_WORKSPACE_CLEAN`; an action appears only with all eight proof fields
+true.
 
 When relevant exclusions exist, `result` is
 `SCAN_COMPLETE_WITH_EXCLUSIONS`. Stable reasons include
@@ -224,12 +305,15 @@ Complexity is introduced only when a demonstrated failure requires it. Optional 
 
 ## Current state
 
-Day 1 and Day 2A are complete with their recorded cross-platform CI evidence.
-Day 2B implements explicit registration, bounded read-only pnpm workspace
-discovery, conservative activity observations, missing-workspace retention,
-and persistent exact-workspace protection. Local format, strict Clippy, tests,
-and live fixture workflows pass; cross-platform CI for the unpushed Day 2B
-commit is still required before the complete Day 2 gate can be marked passed.
-No pnpm adapter, planning, proof, cleanup, execution, or scheduling behaviour
-exists yet. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the
-exact handover state.
+Days 1, 2A, and 2B are complete, and the complete Day 2 gate passed on Ubuntu,
+macOS, and Windows.
+
+Day 3 adds pnpm enrolment, the typed action boundary, the proof bundle, the
+ownership, reference, protection, cloud-sync, Git-cleanliness, observation,
+inactivity, cooldown, and liveness gates, plan identity with expiry and a
+policy hash, plan explanations in `scan --json`, and `--dry-run`.
+
+Nothing executes cleanup yet. There is no executor, journal, per-volume lock,
+threshold loop, process enumeration, or scheduling; those are Days 4 and 5.
+See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact
+handover state.

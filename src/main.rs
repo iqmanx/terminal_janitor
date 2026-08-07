@@ -14,20 +14,23 @@ use terminal_janitor::workflows::{InitOptions, state_file_path};
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
+    let dry_run = cli.dry_run;
     let output = match cli.command {
         Command::Init {
             roots,
             minimum_free,
             target_free,
+            pnpm,
         } => run_init(
             json,
             InitOptions {
                 roots,
                 minimum_free,
                 target_free,
+                pnpm,
             },
         ),
-        Command::Scan => run_scan(json),
+        Command::Scan => run_scan(json, dry_run),
         Command::Protect { command } => run_protection(json, command),
         Command::Status => run_status(json),
     };
@@ -46,7 +49,7 @@ fn run_init(json: bool, options: InitOptions) -> CommandOutput {
     execute_init(json, &config_path, &state_path, options)
 }
 
-fn run_scan(json: bool) -> CommandOutput {
+fn run_scan(json: bool, dry_run: bool) -> CommandOutput {
     let config_path = match config_file_path() {
         Ok(path) => path,
         Err(error) => return configuration_path_failure(json, &error),
@@ -55,7 +58,7 @@ fn run_scan(json: bool) -> CommandOutput {
         Ok(path) => path,
         Err(error) => return render_failure(json, "FAILED_STATE", &error, 5),
     };
-    execute_scan(json, &config_path, &state_path)
+    execute_scan(json, &config_path, &state_path, dry_run)
 }
 
 fn run_protection(json: bool, command: terminal_janitor::cli::ProtectCommand) -> CommandOutput {

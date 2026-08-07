@@ -26,7 +26,7 @@ use crate::identity::{CanonicalPath, FileId, IdentityError, PathIdentity, Volume
 pub const MAX_STATE_DB_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Current schema version; equals the number of entries in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Ordered, explicit migrations. Each entry upgrades the schema by exactly
 /// one version and runs inside one transaction together with the version
@@ -101,6 +101,17 @@ const MIGRATIONS: &[&str] = &[
         WHERE status IN ('present', 'missing');
     CREATE INDEX workspaces_by_file
         ON workspaces (volume_id, file_id);",
+    // v3: the single enrolled pnpm executable. One row by construction, so a
+    // second enrolment replaces the first rather than leaving two executables
+    // with cleanup authority.
+    "CREATE TABLE pnpm_enrolment (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        canonical_path TEXT NOT NULL,
+        volume_id TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        version TEXT NOT NULL,
+        enrolled_at INTEGER NOT NULL
+    ) STRICT;",
 ];
 
 /// Milliseconds since the Unix epoch.
@@ -148,6 +159,12 @@ impl ApprovedRootId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Test-only construction; see [`WorkspaceId::for_tests`].
+    #[cfg(test)]
+    pub(crate) fn for_tests(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 impl fmt::Display for ApprovedRootId {
@@ -162,6 +179,13 @@ pub struct WorkspaceId(String);
 impl WorkspaceId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Test-only construction. Production identities are only ever produced by
+    /// the ledger, so no caller can name a workspace the ledger does not hold.
+    #[cfg(test)]
+    pub(crate) fn for_tests(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -273,6 +297,18 @@ pub struct WorkspaceRecord {
     pub git_state: GitState,
     pub git_head_fingerprint: Option<String>,
     pub git_index_fingerprint: Option<String>,
+}
+
+/// The stored identity of the one enrolled pnpm executable.
+///
+/// The version is kept as the text pnpm reported. The ledger deliberately does
+/// not parse it: persistence stores what was observed, and the pnpm adapter
+/// owns the meaning of that text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PnpmEnrolmentRecord {
+    pub identity: PathIdentity,
+    pub version: String,
+    pub enrolled_at: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +469,10 @@ pub trait StateStore {
     fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<WorkspaceRecord>, StateError>;
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, StateError>;
     fn set_protected(&mut self, id: &WorkspaceId, protected: bool) -> Result<(), StateError>;
+    /// Replaces the enrolled pnpm executable. Enrolment is deliberately
+    /// singular: exactly one executable may ever hold cleanup authority.
+    fn set_pnpm_enrolment(&mut self, enrolment: &PnpmEnrolmentRecord) -> Result<(), StateError>;
+    fn get_pnpm_enrolment(&self) -> Result<Option<PnpmEnrolmentRecord>, StateError>;
 }
 
 /// Bundled-SQLite implementation of [`StateStore`].
@@ -1056,6 +1096,73 @@ impl StateStore for SqliteStateStore {
             Ok(())
         })
     }
+
+    fn set_pnpm_enrolment(&mut self, enrolment: &PnpmEnrolmentRecord) -> Result<(), StateError> {
+        let db_path = self.db_path.clone();
+        let enrolment = enrolment.clone();
+        self.mutate(|tx, _now| {
+            tx.execute(
+                "INSERT INTO pnpm_enrolment
+                    (id, canonical_path, volume_id, file_id, version, enrolled_at)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (id) DO UPDATE SET
+                    canonical_path = excluded.canonical_path,
+                    volume_id = excluded.volume_id,
+                    file_id = excluded.file_id,
+                    version = excluded.version,
+                    enrolled_at = excluded.enrolled_at",
+                params![
+                    enrolment.identity.canonical.as_str(),
+                    enrolment.identity.volume.as_str(),
+                    enrolment.identity.file.as_str(),
+                    enrolment.version,
+                    enrolment.enrolled_at.0,
+                ],
+            )
+            .map_err(|error| map_op_error(&db_path, &error))?;
+            Ok(())
+        })
+    }
+
+    fn get_pnpm_enrolment(&self) -> Result<Option<PnpmEnrolmentRecord>, StateError> {
+        let raw: Option<(String, String, String, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT canonical_path, volume_id, file_id, version, enrolled_at
+                 FROM pnpm_enrolment WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| self.op_error(&error))?;
+        let Some((canonical_path, volume_id, file_id, version, enrolled_at)) = raw else {
+            return Ok(None);
+        };
+        // A row that cannot be turned back into a real identity is corruption,
+        // not an absent enrolment; reporting `None` would silently drop the
+        // executable identity that authority depends on.
+        let corrupt = |error: IdentityError| StateError::Corrupt {
+            path: self.db_path.clone(),
+            message: format!("pnpm_enrolment holds an unusable identity: {error}"),
+        };
+        Ok(Some(PnpmEnrolmentRecord {
+            identity: PathIdentity::from_parts(
+                CanonicalPath::from_verified(PathBuf::from(canonical_path)).map_err(corrupt)?,
+                VolumeId::new(volume_id).map_err(corrupt)?,
+                FileId::new(file_id).map_err(corrupt)?,
+            ),
+            version,
+            enrolled_at: Timestamp(enrolled_at),
+        }))
+    }
 }
 
 fn add_root_tx(
@@ -1556,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_to_v2_migration_preserves_protection_and_adds_unknown_git_state() {
+    fn migration_from_v1_preserves_protection_and_reaches_the_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db = temp_db(&dir);
         {
@@ -1581,12 +1688,79 @@ mod tests {
             .unwrap();
         }
         let store = open_at(&db, &FixedClock::new(3));
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let workspaces = store.list_workspaces().unwrap();
         assert_eq!(workspaces.len(), 1);
         assert!(workspaces[0].protected);
         assert_eq!(workspaces[0].git_state, GitState::Unknown);
         assert_eq!(workspaces[0].status, WorkspaceStatus::Present);
+        // v3 adds enrolment storage. Upgrading must not invent an enrolment:
+        // an upgraded ledger has no pnpm until one is explicitly enrolled.
+        assert_eq!(store.get_pnpm_enrolment().unwrap(), None);
+    }
+
+    #[test]
+    fn pnpm_enrolment_round_trips_and_a_second_enrolment_replaces_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let clock = FixedClock::new(1_000);
+        let mut store = open_at(&db, &clock);
+        assert_eq!(store.get_pnpm_enrolment().unwrap(), None);
+
+        let first = PnpmEnrolmentRecord {
+            identity: PathIdentity::from_parts(
+                CanonicalPath::from_verified(PathBuf::from(WS_A)).unwrap(),
+                VolumeId::new("vol-1").unwrap(),
+                FileId::new("file-1").unwrap(),
+            ),
+            version: "11.2.3".to_owned(),
+            enrolled_at: Timestamp(1_000),
+        };
+        store.set_pnpm_enrolment(&first).unwrap();
+        assert_eq!(store.get_pnpm_enrolment().unwrap(), Some(first));
+
+        let second = PnpmEnrolmentRecord {
+            identity: PathIdentity::from_parts(
+                CanonicalPath::from_verified(PathBuf::from(ROOT_A)).unwrap(),
+                VolumeId::new("vol-2").unwrap(),
+                FileId::new("file-2").unwrap(),
+            ),
+            version: "12.0.0".to_owned(),
+            enrolled_at: Timestamp(2_000),
+        };
+        store.set_pnpm_enrolment(&second).unwrap();
+        assert_eq!(store.get_pnpm_enrolment().unwrap(), Some(second));
+
+        // Exactly one executable may hold cleanup authority.
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM pnpm_enrolment", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_corrupt_enrolment_row_is_an_error_rather_than_an_absent_enrolment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let clock = FixedClock::new(1_000);
+        {
+            let store = open_at(&db, &clock);
+            store
+                .conn
+                .execute(
+                    "INSERT INTO pnpm_enrolment
+                     (id, canonical_path, volume_id, file_id, version, enrolled_at)
+                     VALUES (1, 'not-absolute', 'vol-1', 'file-1', '11.2.3', 1)",
+                    [],
+                )
+                .unwrap();
+        }
+        let store = open_at(&db, &clock);
+        assert!(matches!(
+            store.get_pnpm_enrolment(),
+            Err(StateError::Corrupt { .. })
+        ));
     }
 
     // ---- identity behaviour --------------------------------------------

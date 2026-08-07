@@ -790,11 +790,150 @@ Exact next action: **Day 3 — Pnpm Adapter, Proof Gates & Planning**.
 
 ### Day 3 — Pnpm adapter, proof gates, planning
 
-Status: **in progress**
+Status: **implementation complete locally; Day 3 gate pending cross-platform CI**
 
-Started 2026-08-07, immediately after the complete Day 2 gate closed on run
-`31163641988`. Day 3 produces complete, non-executable cleanup plans with
-mechanical proof for every decision. No destructive command may run in Day 3.
+Date: 2026-08-07
+
+Started immediately after the complete Day 2 gate closed on run `31163641988`.
+
+Files changed:
+
+```text
+src/adapters/mod.rs   (new)
+src/adapters/pnpm.rs  (new)
+src/adapters/git.rs   (new)
+src/planner.rs        (new)
+src/protection.rs     (new)
+src/state.rs
+src/workflows.rs
+src/cli.rs
+src/main.rs
+src/lib.rs
+tests/cli_tests.rs
+README.md
+IMPLEMENTATION_STATUS.md
+```
+
+Dependencies added and why:
+
+- None. Day 3 uses the existing dependencies plus the standard library's
+  `std::process` and `std::thread`.
+
+Delivered:
+
+- typed `AllowedAction` with exactly the three `SAFETY.md` variants, fixed
+  compiled argument arrays (`pm clean`, `store prune`), and no variant carrying
+  a caller-supplied path or command string;
+- `CommandRunner` with a direct, shell-free system implementation: argument
+  arrays only, stdin closed, per-stream bounded capture on separate reader
+  threads so a full pipe cannot deadlock the timeout, an enforced timeout that
+  kills and reaps the child, and truncated or non-UTF-8 output treated as
+  ambiguous;
+- pnpm enrolment during `init` with `--pnpm <path>` or a single `PATH` search,
+  canonical executable identity (path, volume, file), `pnpm --version` as the
+  only command run, strict version parsing that rejects empty, multi-line,
+  prefixed, or partial output, and a minimum major version of 11;
+- refusal of `.cmd`, `.bat`, `.ps1`, `.psm1`, `.vbs`, and `.js` wrappers,
+  because executing one would place `cmd.exe` or PowerShell between the product
+  and pnpm;
+- schema v3 storing exactly one pnpm enrolment, replacing rather than
+  accumulating, with a corrupt row reported as corruption instead of absence;
+- read-only Git worktree proof through
+  `git --no-optional-locks status --porcelain=v1 --untracked-files=all`, where
+  empty output is clean, any line is dirty, and a missing Git, non-zero exit,
+  timeout, or truncated output is `unknown`;
+- location protection: explicit protection, a denylist built from the
+  platform's own user directories rather than guessed English names, recognised
+  cloud-sync providers, and unidentifiable sync names refused as ambiguous;
+  provider markers are probed only at or below an approved root, so no
+  unapproved directory is ever inspected;
+- `ProofBundle` with all eight `SAFETY.md` fields and no score, weight, or
+  override; an action reaches a plan only when every field is true;
+- ordered gates returning exactly one failure each: registration status,
+  approved-root ownership, live identity revalidation, pressured volume,
+  protection, the three pnpm markers, pnpm enrolment/version/identity, Git
+  cleanliness, the 24-hour observation window, the 30-day inactivity window,
+  the 7-day workspace cooldown, and process liveness;
+- deterministic ordering by oldest proven activity, then oldest first
+  observation, then canonical path, with a two-workspace automatic cap and the
+  remainder reported as `AUTOMATIC_WORKSPACE_CAP_REACHED`;
+- immutable plan identity: an FNV-1a policy hash over thresholds, approved
+  roots, every window and cap, the minimum pnpm major, the action names, and
+  the enrolled executable identity and version; a plan ID over the policy hash,
+  the creation moment, and the exact action list; and a 15-minute expiry;
+- `scan` explanations — one plan per volume holding registered workspaces,
+  ordered by volume identity, in both human and JSON output;
+- a global `--dry-run` that reads and reports without writing the ledger.
+
+Design decisions worth carrying forward:
+
+- **Production plans no workspace clean yet, by design.** Process enumeration
+  is Day 5 scope in `PLANS.md`. Rather than leave the liveness gate absent or
+  silently passing, Day 3 ships `UnavailableLivenessProver`, which answers
+  `Unknown` for every workspace. Unknown skips, so a real machine reports
+  `LIVENESS_UNKNOWN` and plans nothing destructive. This keeps the Day 4
+  executor structurally unable to clean a workspace whose liveness was never
+  proven. Tests inject a prover to exercise the eligible path.
+- **Git is resolved, not enrolled.** Pnpm is the delegate that deletes, so its
+  identity is stored and revalidated. Git only answers a question, and every
+  failure mode already collapses to `unknown`, so it is located at plan time
+  and never granted stored authority.
+- **The pnpm-store cooldown is Day 4.** `PLANS.md` assigns "pnpm-store cooldown
+  and one immediate post-clean exception" to Day 4. Day 3 implements the
+  workspace cooldown, which the existing `last_cleaned_at` column supports, and
+  adds no state for the store cooldown.
+- **Enrolment never fails registration.** `ACCEPTANCE.md` section A requires
+  pnpm only when a pnpm action is used, so a missing, old, or wrapper-only pnpm
+  is reported in the init result and leaves approved roots registered.
+
+Commands run locally:
+
+```text
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
+
+- 159/159 tests pass, 0 failed, 0 ignored (153 unit + 6 actual-binary
+  integration tests), up from 102 at the close of Day 2;
+- adapter tests cover the fixed argument arrays, the absence of a bare
+  `pnpm clean` and of `--lockfile`, `-l`, and `--force`, version parsing and
+  rejection, enrolment identity, wrapper refusal, directory and missing-file
+  refusal, and every Git failure mode collapsing to `unknown`;
+- protection tests cover explicit protection precedence, confirmed and
+  name-only provider detection, ambiguous names failing closed, denied roots,
+  a sibling that merely shares a name prefix, and the filesystem root never
+  becoming a boundary;
+- planner tests cover a complete proof bundle, each gate refusing in isolation,
+  each missing marker, dirty and unknown Git, active and unknown liveness, the
+  production prover planning nothing, ordering and both tie-breaks, the
+  two-workspace cap, deterministic identical plans, policy-hash and plan-ID
+  change on policy or time change, and expiry at and after the boundary;
+- the CLI integration test replaces `pnpm`, `npm`, `node`, `git`, `sh`, and
+  `bash` with logging scripts and asserts token by token that only
+  `pnpm --version` and `git --no-optional-locks status …` ever run, that no
+  `clean`, `--lockfile`, `-l`, or `--force` argument is ever passed, that a new
+  workspace is refused with exactly `OBSERVATION_WINDOW_NOT_MET`, and that
+  `--dry-run` leaves the ledger file byte-identical.
+
+Known limitations:
+
+- No workspace clean is planned on a real machine until Day 5 supplies process
+  liveness. This is the intended fail-closed behaviour, not a defect.
+- Cloud-sync detection above an approved root is name-based only, because
+  inspecting an unapproved parent is not permitted. A provider marker outside
+  the approved root is never read.
+- Local evidence is Linux/aarch64. Windows wrapper refusal is proven by unit
+  tests that construct the wrapper names on any platform; no real Windows
+  `pnpm.cmd` has been exercised on a Windows machine.
+
+Blockers: none.
+
+Exact next action: require Ubuntu, macOS, and Windows CI to pass for the Day 3
+commit, record the run, then begin **Day 4 — Verified Executor and Threshold
+Loop**.
 
 ### Days 4–7
 
@@ -804,19 +943,18 @@ Follow `PLANS.md` strictly. Do not begin a later day until the current day's man
 
 ## Current repository contents
 
-Days 1, 2A, and 2B contain the systems, configuration, status/CLI, identity,
-state ledger, registration, discovery, activity-observation, and protection
-foundation. Still intentionally absent (Day 3 and later scope):
+Days 1, 2A, 2B, and 3 contain the systems, configuration, status/CLI, identity,
+state ledger, registration, discovery, activity-observation, protection,
+pnpm/Git adapters, and proof-driven planning foundation. Still intentionally
+absent (Day 4 and later scope):
 
 ```text
-src/planner.rs
 src/executor.rs
 src/journal.rs
-src/adapters/
 scripts/
 ```
 
-Their absence is not a defect at this point in the plan. Present after Day 2B:
+Their absence is not a defect at this point in the plan. Present after Day 3:
 
 ```text
 Cargo.toml
@@ -833,6 +971,11 @@ src/status.rs
 src/workflows.rs
 src/model.rs
 src/disk.rs
+src/planner.rs
+src/protection.rs
+src/adapters/mod.rs
+src/adapters/pnpm.rs
+src/adapters/git.rs
 src/platform/
 tests/cli_tests.rs
 .github/workflows/ci.yml
@@ -843,16 +986,20 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Continue **Day 3 — Pnpm Adapter, Proof Gates & Planning**: pnpm enrolment
-   during `init` with canonical executable path, version, and a minimum major
-   version of 11; typed `AllowedAction`; `ProofBundle`; ownership, reference,
-   liveness, and protection gates; cloud-sync protection; Git cleanliness;
-   observation and inactivity requirements; cooldowns; immutable plan ID,
-   expiry, and policy hash; `scan --json` explanations; and `--dry-run`.
-3. Keep Day 3 non-executable. No cleanup command may run until Day 4.
+2. Confirm the recorded Day 3 CI evidence below, then begin **Day 4 — Verified
+   Executor and Threshold Loop**: per-volume lock, run and action journal,
+   direct execution with exact argument arrays, command timeout and bounded
+   output, pre-action proof and identity revalidation, free-space measurement
+   before and after every action, stop-at-target, shortfall, the two-workspace
+   cap, own-state cleanup, and the pnpm-store cooldown with its one immediate
+   post-clean exception.
+3. Do not weaken the Day 3 liveness gate to make an executor demonstration
+   work. `UnavailableLivenessProver` must keep answering `Unknown` until Day 5
+   supplies real process enumeration; a Day 4 demonstration uses an injected
+   prover and generated fixtures.
 4. Prove every path-containment change with a linked-ancestor fixture, not only
    a plain temporary directory, and require Ubuntu, macOS, and Windows CI
-   before claiming the Day 3 gate.
+   before claiming any gate.
 
 ## Required status-update format
 

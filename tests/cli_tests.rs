@@ -152,24 +152,41 @@ fn init_scan_and_protection_cli_workflows_emit_stable_json() {
             )
         })
         .collect();
+    // Every external tool is replaced by a script that appends its own name
+    // and arguments to one log, so the test can assert exactly what ran rather
+    // than only that something did.
     let fake_bin = home.path().join("fake-bin");
     std::fs::create_dir(&fake_bin).unwrap();
-    let invoked = home.path().join("external-command-was-invoked");
+    let invocations = home.path().join("invocations.log");
     use std::os::unix::fs::PermissionsExt;
     for executable in ["pnpm", "npm", "node", "git", "sh", "bash"] {
         let path = fake_bin.join(executable);
+        // pnpm answers --version so enrolment can succeed; git answers an
+        // empty porcelain status, which means a clean worktree.
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nprintf invoked > '{}'\n", invoked.display()),
+            format!(
+                "#!/bin/sh\nprintf '{executable} %s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = \"--version\" ]; then echo 11.2.3; fi\n",
+                invocations.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let root_text = root.to_str().unwrap();
     let workspace_text = workspace.to_str().unwrap();
+    let fake_pnpm = fake_bin.join("pnpm");
 
     let init = command(home.path())
-        .args(["init", "--root", root_text, "--json"])
+        .args([
+            "init",
+            "--root",
+            root_text,
+            "--pnpm",
+            fake_pnpm.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_success(&init);
@@ -177,6 +194,8 @@ fn init_scan_and_protection_cli_workflows_emit_stable_json() {
     assert_eq!(init_json["result"], "INIT_COMPLETE");
     assert_eq!(init_json["scheduling_enabled"], false);
     assert_eq!(init_json["scan_performed"], false);
+    assert_eq!(init_json["pnpm_enrolled"], true);
+    assert_eq!(init_json["pnpm_version"], "11.2.3");
 
     let scan = command(home.path())
         .env("PATH", &fake_bin)
@@ -204,14 +223,71 @@ fn init_scan_and_protection_cli_workflows_emit_stable_json() {
             "missing",
             "protected_workspaces",
             "cleanup_performed",
+            "dry_run",
+            "plans",
         ])
     );
     assert_eq!(scan_json["registered"].as_array().unwrap().len(), 1);
     assert_eq!(scan_json["cleanup_performed"], false);
+    assert_eq!(scan_json["dry_run"], false);
+
+    // A workspace registered moments ago can never be cleaned, and the plan
+    // must say so with one exact gate.
+    let plans = scan_json["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 1);
+    let skipped = plans[0]["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["gate"], "OBSERVATION_WINDOW_NOT_MET");
+    assert!(!skipped[0]["reason"].as_str().unwrap().is_empty());
     assert!(
-        !invoked.exists(),
-        "scan must invoke no pnpm, package script, Git, Node, or shell process"
+        plans[0]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "PNPM_WORKSPACE_CLEAN"),
+        "no workspace clean may be planned for a newly observed workspace"
     );
+
+    // Day 3 may ask questions. It may not clean anything. Every line is
+    // checked token by token, so no forbidden argument can hide inside a
+    // longer word.
+    let log = std::fs::read_to_string(&invocations).unwrap_or_default();
+    for line in log.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            matches!(tokens.first(), Some(&"pnpm") | Some(&"git")),
+            "unexpected external program invoked: {line:?}"
+        );
+        for token in &tokens[1..] {
+            assert!(
+                !matches!(*token, "clean" | "--lockfile" | "-l" | "--force"),
+                "{token:?} must never be passed; the invocation was {line:?}"
+            );
+        }
+    }
+    assert!(
+        log.contains("pnpm --version"),
+        "enrolment must read the pnpm version; log was {log:?}"
+    );
+    assert!(
+        log.contains("git --no-optional-locks status"),
+        "planning must ask Git for worktree state; log was {log:?}"
+    );
+
+    // A dry run reports without writing, so the ledger is untouched by it.
+    let state_file = home.path().join("data/terminal_janitor/state.sqlite3");
+    let before_state = std::fs::read(&state_file).unwrap();
+    let dry = command(home.path())
+        .env("PATH", &fake_bin)
+        .args(["scan", "--json", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_success(&dry);
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry_json["dry_run"], true);
+    assert!(dry_json["registered"].as_array().unwrap().is_empty());
+    assert!(dry_json["updated"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(&state_file).unwrap(), before_state);
 
     for (args, expected) in [
         (
