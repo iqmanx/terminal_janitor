@@ -434,6 +434,77 @@ fn a_broken_link_and_an_over_deep_tree_register_nothing_and_stop_nothing() {
     );
 }
 
+/// `SAFETY.md` caps logs at 10 MiB. This product meets that by writing no log
+/// at all: the SQLite journal is the only record, and it is capped separately
+/// at 200 runs and 20 MiB. That is worth pinning down rather than assuming, so
+/// a log file added later has to arrive with its cap.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_writes_no_log_only_its_ledger_and_its_lock() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("projects");
+    std::fs::create_dir_all(root.join("api")).unwrap();
+    for marker in ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"] {
+        std::fs::write(root.join("api").join(marker), b"fixture").unwrap();
+    }
+
+    assert_success(
+        &command(home.path())
+            .args([
+                "init",
+                "--root",
+                root.to_str().unwrap(),
+                "--pnpm",
+                "/terminal_janitor-test-no-such-pnpm",
+                "--minimum-free",
+                "900000GiB",
+                "--target-free",
+                "950000GiB",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_success(
+        &command(home.path())
+            .args(["scan", "--json"])
+            .output()
+            .unwrap(),
+    );
+    // A pressured run: it journals, takes its lock, and finds nothing eligible.
+    let _ = command(home.path())
+        .args(["check", "--json"])
+        .output()
+        .unwrap();
+
+    let state = home.path().join("data/terminal_janitor");
+    let mut stack = vec![state.clone()];
+    let mut found = Vec::new();
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    assert!(!found.is_empty(), "the run must have written its ledger");
+
+    for path in &found {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let permitted = name == "state.sqlite3"
+            || name.starts_with("state.sqlite3-")     // SQLite -wal/-shm sidecars
+            || (name.starts_with("volume-") && name.ends_with(".lock"));
+        assert!(
+            permitted,
+            "{} is neither the ledger nor a lock; an uncapped log would live here",
+            path.display()
+        );
+    }
+}
+
 /// Windows reaches the same shape through reparse points rather than POSIX
 /// symlinks. The final-component refusal that protects an approved root keys
 /// off `is_symlink`, so this asserts that assumption holds for a real reparse

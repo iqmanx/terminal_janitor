@@ -141,8 +141,120 @@ jobs:
           fi
           echo "uninstall kept state, then purged it on request"
 
+  # A genuinely separate local account, created here, on each platform.
+  # ACCEPTANCE.md rejects a platform-exempt item, so this may not be Linux-only.
+  clean-account-macos:
+    name: install and uninstall from a clean account (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: build
+        run: cargo build --release
+
+      - name: create a clean user account
+        run: |
+          set -euo pipefail
+          uid=550
+          sudo dscl . -create /Users/tjfresh
+          sudo dscl . -create /Users/tjfresh UserShell /bin/bash
+          sudo dscl . -create /Users/tjfresh RealName "TJ Fresh"
+          sudo dscl . -create /Users/tjfresh UniqueID "$uid"
+          sudo dscl . -create /Users/tjfresh PrimaryGroupID 20
+          sudo dscl . -create /Users/tjfresh NFSHomeDirectory /Users/tjfresh
+          sudo mkdir -p /Users/tjfresh
+          sudo chown -R tjfresh:staff /Users/tjfresh
+          sudo cp target/release/terminal_janitor /usr/local/share/terminal_janitor-build
+          sudo chmod 0755 /usr/local/share/terminal_janitor-build
+          sudo cp install.sh uninstall.sh /Users/tjfresh/
+          sudo chown tjfresh:staff /Users/tjfresh/install.sh /Users/tjfresh/uninstall.sh
+          sudo chmod 0755 /Users/tjfresh/install.sh /Users/tjfresh/uninstall.sh
+
+      - name: install, upgrade, and uninstall as that user
+        run: |
+          set -euo pipefail
+          sudo -u tjfresh env -i \
+            HOME=/Users/tjfresh USER=tjfresh LOGNAME=tjfresh \
+            PATH=/usr/local/bin:/usr/bin:/bin SHELL=/bin/bash \
+            bash -lc '
+            set -eu
+            cd "$HOME"
+            ./install.sh --from /usr/local/share/terminal_janitor-build
+            test -x "$HOME/.local/bin/terminal_janitor"
+            tj="$HOME/.local/bin/terminal_janitor"
+            "$tj" --version
+            mkdir -p "$HOME/projects/api"
+            printf "{\"name\":\"api\"}" > "$HOME/projects/api/package.json"
+            printf "packages: []\n" > "$HOME/projects/api/pnpm-workspace.yaml"
+            printf "lockfileVersion: 9\n" > "$HOME/projects/api/pnpm-lock.yaml"
+            "$tj" init --root "$HOME/projects" --json
+            "$tj" scan --json
+            config="$HOME/Library/Application Support/terminal_janitor/config.toml"
+            test -f "$config"
+            test ! -f "$HOME/Library/LaunchAgents/io.terminal-janitor.check.plist"
+
+            before="$(shasum -a 256 "$config" | cut -d" " -f1)"
+            ./install.sh --from /usr/local/share/terminal_janitor-build
+            after="$(shasum -a 256 "$config" | cut -d" " -f1)"
+            [ "$before" = "$after" ] || { echo "upgrade changed configuration"; exit 1; }
+
+            ./uninstall.sh
+            test ! -f "$tj"
+            test -f "$config"
+            ./uninstall.sh --purge
+            echo "clean-account install, upgrade, and uninstall all succeeded"
+          '
+
+  clean-account-windows:
+    name: install and uninstall from a clean account (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: build
+        run: cargo build --release
+
+      # Start-Process -Credential runs as a genuinely different local account,
+      # with its own profile, its own AppData, and its own user PATH.
+      - name: install and uninstall as a clean local account
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $password = ConvertTo-SecureString 'Fr3sh-Acct!' -AsPlainText -Force
+          New-LocalUser -Name 'tjfresh' -Password $password -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Users' -Member 'tjfresh'
+          $credential = New-Object System.Management.Automation.PSCredential('tjfresh', $password)
+
+          $share = 'C:\tjshare'
+          New-Item -ItemType Directory -Path $share -Force | Out-Null
+          Copy-Item target\release\terminal_janitor.exe $share
+          Copy-Item install.ps1, uninstall.ps1 $share
+          Copy-Item .github\scripts\clean-account.ps1 $share
+
+          # The fresh account needs to run the scripts and write its result.
+          $acl = Get-Acl $share
+          $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            'tjfresh', 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+          Set-Acl $share $acl
+
+          Start-Process -FilePath 'pwsh.exe' `
+            -ArgumentList '-NoProfile', '-File', "$share\clean-account.ps1" `
+            -Credential $credential -WorkingDirectory $share -Wait
+
+          $result = Get-Content "$share\result.txt" -ErrorAction SilentlyContinue
+          Write-Host "result: $result"
+          if ($result -ne 'CLEAN_ACCOUNT_OK') {
+            throw "the clean account run did not succeed: $result"
+          }
+
   clean-account:
-    name: install and uninstall from a clean account
+    name: install and uninstall from a clean account (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
