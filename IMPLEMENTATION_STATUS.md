@@ -1461,13 +1461,14 @@ because the Windows job had never reached `cargo test` before it.
 
 Known limitations:
 
-- **CI cannot distinguish the Windows reparse-point test asserting from the
-  test declining its fixture.** It returns early when the host denies the
-  privilege to create a reparse point, and a skipped body and a passing body
-  are both reported as one passing test. GitHub's Windows runners are
-  administrative, so creation is expected to succeed, but that is an
-  expectation, not recorded evidence. Making the outcome observable — or
-  proving it on a real Windows machine — is outstanding.
+- ~~CI cannot distinguish the Windows reparse-point test asserting from the
+  test declining its fixture.~~ **Resolved on 2026-08-07.** The early return
+  was removed: creating the reparse point is now mandatory and its failure is
+  loud, explaining that `SeCreateSymbolicLinkPrivilege` is missing. Windows CI
+  run `31219148356` reports
+  `a_windows_reparse_point_is_seen_as_a_link_and_grants_no_second_identity ...
+  ok`, so the fixture was genuinely created and the assertions genuinely ran.
+  The `ACCEPTANCE.md` item is ticked on that basis.
 - The Windows reparse-point assertion is a property test about what the
   platform reports, not an end-to-end refusal through the binary. The
   integration tests that drive the real binary are Linux-only because the

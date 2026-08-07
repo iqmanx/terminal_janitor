@@ -418,10 +418,26 @@ identity revalidation, measurement after every action, stop-at-target, the
 safe-shortfall result, the two-workspace cap, own-state cleanup, the one
 permitted post-clean store prune, and `check`, `clean`, and `history`.
 
-Day 5 adds real process liveness, native per-user scheduling, and the macOS
-capacity rule. Its gate is **not** met: `PLANS.md` requires enabling,
-triggering, and disabling the schedule on real Linux, macOS, and Windows
-machines, and none of that has been performed. macOS also cannot clean a
-workspace until snapshot-aware capacity measurement exists. Both are recorded
-as blockers. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the
-exact handover state.
+Day 5 adds real process liveness, native per-user scheduling, and snapshot-aware
+macOS capacity. Its gate is met: the schedule was enabled, triggered, observed
+firing the binary, and disabled on real Linux, macOS, and Windows machines, and
+macOS now resolves the purgeable/snapshot ambiguity through Foundation instead
+of refusing to clean.
+
+Day 6 is adversarial hardening — the safety model attacked from outside the
+crate, through the real binary and the real filesystem — and Day 7 is release
+qualification: per-user installers, checksummed artefacts for five targets, a
+thousand simulated scheduler cycles, and clean-account install and uninstall on
+all three platforms.
+
+**0.1.0 is not released.** Every gate is met and every artefact is built, but
+tagging is the owner's decision and has not been taken. Two things remain
+honestly short of proof and are recorded rather than glossed: no test has yet
+downloaded a published artefact and checked it against a published
+`SHA256SUMS`, which only becomes possible once a release exists; and a
+scheduled run cannot reach an actual workspace clean in CI, because the
+24-hour observation window is a real safety gate and a CI fixture is seconds
+old.
+
+See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact
+handover state and the CI run identifiers behind each gate.

@@ -185,11 +185,7 @@ rather than left to look like the rest:
 - [x] Windows CI passes.
 - [x] No mandatory safety test is ignored.
 - [x] Symlink-loop test passes.
-- [ ] Windows junction/reparse test passes. (The test exists and passes on
-      Windows CI, but it returns early if the host denies the privilege to
-      create a reparse point, and CI cannot tell a skipped body from a passing
-      one. Left unticked deliberately: this file rejects a manually assumed
-      item, and "it probably ran" is an assumption.)
+- [x] Windows junction/reparse test passes.
 - [x] Mount-boundary test passes.
 - [x] Dirty/untracked project test passes.
 - [x] Active-process test passes.
