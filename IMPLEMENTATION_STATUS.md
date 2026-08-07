@@ -7,8 +7,8 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Days 1, 2A, and 2B complete; complete Day 2 gate passed on
-                Ubuntu, macOS, and Windows; Day 3 in progress
+Current phase:  Days 1, 2A, 2B, and 3 complete; the Day 2 and Day 3 gates
+                both passed on Ubuntu, macOS, and Windows; Day 4 not started
 ```
 
 ## Governing state
@@ -790,11 +790,16 @@ Exact next action: **Day 3 — Pnpm Adapter, Proof Gates & Planning**.
 
 ### Day 3 — Pnpm adapter, proof gates, planning
 
-Status: **implementation complete locally; Day 3 gate pending cross-platform CI**
+Status: **complete; Day 3 gate passed on Ubuntu, macOS, and Windows**
 
 Date: 2026-08-07
 
 Started immediately after the complete Day 2 gate closed on run `31163641988`.
+
+Commits:
+
+- `b244281` — `feat: add proof-driven pnpm planning`
+- `fae3f7c` — `fix: make Day 3 fixtures portable and collapse the PATH lookup match`
 
 Files changed:
 
@@ -918,6 +923,32 @@ Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
   workspace is refused with exactly `OBSERVATION_WINDOW_NOT_MET`, and that
   `--dry-run` leaves the ledger file byte-identical.
 
+Cross-platform gate:
+
+The first Day 3 run (`31166832906`) failed on all three platforms during
+strict Clippy, before any test executed: CI stable is 1.97 and raises
+`clippy::collapsible_match` on the pnpm `PATH` lookup, which the local 1.93
+toolchain does not. `fae3f7c` collapses that lookup to the same single
+question the Git lookup already asks, and also makes the planner and
+protection fixtures portable — they wrote POSIX paths such as `/approved/a`,
+which Windows does not treat as absolute, so they would have failed
+`CanonicalPath::from_verified` and been silently dropped from the denylist
+once Clippy stopped masking them.
+
+CI evidence for `fae3f7c` — run `31167346665`,
+`https://github.com/iqmanx/terminal_janitor/actions/runs/31167346665`:
+
+```text
+test (ubuntu-latest)   success   153 unit + 0 + 6 integration; 0 failed; 0 ignored
+test (macos-latest)    success   153 unit + 0 + 4 integration; 0 failed; 0 ignored
+test (windows-latest)  success   148 unit + 0 + 4 integration; 0 failed; 0 ignored
+```
+
+All three jobs ran `cargo fmt --check`, strict Clippy, and `cargo test
+--all-targets`, and all three passed with no ignored test. The lower macOS and
+Windows counts are `#[cfg(unix)]` and Unix-only-fixture tests that are not
+compiled there, not tests skipped at runtime.
+
 Known limitations:
 
 - No workspace clean is planned on a real machine until Day 5 supplies process
@@ -937,9 +968,7 @@ Known limitations:
 
 Blockers: none.
 
-Exact next action: require Ubuntu, macOS, and Windows CI to pass for the Day 3
-commit, record the run, then begin **Day 4 — Verified Executor and Threshold
-Loop**.
+Exact next action: begin **Day 4 — Verified Executor and Threshold Loop**.
 
 ### Days 4–7
 
@@ -992,8 +1021,7 @@ tests/cli_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Confirm the recorded Day 3 CI evidence below, then begin **Day 4 — Verified
-   Executor and Threshold Loop**: per-volume lock, run and action journal,
+2. Begin **Day 4 — Verified Executor and Threshold Loop**: per-volume lock, run and action journal,
    direct execution with exact argument arrays, command timeout and bounded
    output, pre-action proof and identity revalidation, free-space measurement
    before and after every action, stop-at-target, shortfall, the two-workspace
