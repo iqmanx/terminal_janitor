@@ -7,13 +7,11 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Days 1 through 4 complete, every gate passed on Ubuntu,
-                macOS, and Windows. Days 5 and 6 are implemented and neither
-                gate is met. Day 5 requires real-machine scheduler
-                verification on all three platforms, and macOS cannot clean a
-                workspace at all until snapshot-aware capacity measurement
-                exists. Day 6 requires three-platform CI, which has not run
-                for its commit; its local suite is green.
+Current phase:  Days 1 through 4 and Day 6 complete, every gate passed on
+                Ubuntu, macOS, and Windows. Day 5 is implemented but its gate
+                is NOT met: it requires real-machine scheduler verification on
+                all three platforms, and macOS cannot clean a workspace at
+                all until snapshot-aware capacity measurement exists.
 ```
 
 ## Governing state
@@ -1268,13 +1266,14 @@ Windows, or record the owner's decision to accept the gap; then **Day 6**.
 
 ### Day 6 — Adversarial hardening
 
-Status: **implemented; the Day 6 gate is NOT yet claimable — it requires
-Ubuntu, macOS, and Windows CI, which has not run for this commit**
+Status: **complete; Day 6 gate passed on Ubuntu, macOS, and Windows**
 
 Date: 2026-08-07
 
-Commit: recorded in the follow-up documentation commit, together with the CI
-run that either closes or reopens this gate.
+Commits:
+
+- `600baa2` — `test: harden terminal_janitor safety boundaries`
+- `5931874` — `fix: gate each item to the platforms that use it`
 
 Files changed:
 
@@ -1284,6 +1283,7 @@ src/identity.rs
 src/journal.rs
 src/executor.rs
 src/planner.rs
+src/scheduler.rs             (cfg fix inherited from Day 5)
 tests/adversarial_tests.rs   (new)
 IMPLEMENTATION_STATUS.md
 ```
@@ -1383,13 +1383,32 @@ Manual evidence:
 - none beyond the automated suite. Day 6 adds no command and no behaviour to
   exercise by hand.
 
+CI evidence for `5931874` — run `31196707193`,
+`https://github.com/iqmanx/terminal_janitor/actions/runs/31196707193`:
+
+```text
+test (ubuntu-latest)   success   216 unit + 0 + 6 adversarial + 7 CLI; 0 failed; 0 ignored
+test (macos-latest)    success   212 unit + 0 + 2 adversarial + 4 CLI; 0 failed; 0 ignored
+test (windows-latest)  success   206 unit + 0 + 2 adversarial + 4 CLI; 0 failed; 0 ignored
+```
+
+All three jobs ran `cargo fmt --check`, strict Clippy, and `cargo test
+--all-targets`, and all three passed with no ignored test. The lower macOS and
+Windows counts are `#[cfg(unix)]` and Linux-only-fixture tests that are not
+compiled there, not tests skipped at runtime: macOS compiles the symlink and
+case-identity adversarial tests, Windows the case-identity and reparse-point
+ones. This run also supplies the Windows test evidence Day 5 never obtained,
+because the Windows job had never reached `cargo test` before it.
+
 Known limitations:
 
-- **The gate is not met.** `PLANS.md` requires all mandatory tests to pass on
-  Ubuntu, macOS, and Windows. Local evidence is Linux/aarch64 only, and Day 2B
-  already proved that a Linux-only run cannot qualify a filesystem-facing
-  change: one path-containment defect passed locally and failed on both other
-  platforms. This gate stays open until CI is recorded here.
+- **CI cannot distinguish the Windows reparse-point test asserting from the
+  test declining its fixture.** It returns early when the host denies the
+  privilege to create a reparse point, and a skipped body and a passing body
+  are both reported as one passing test. GitHub's Windows runners are
+  administrative, so creation is expected to succeed, but that is an
+  expectation, not recorded evidence. Making the outcome observable — or
+  proving it on a real Windows machine — is outstanding.
 - The Windows reparse-point assertion is a property test about what the
   platform reports, not an end-to-end refusal through the binary. The
   integration tests that drive the real binary are Linux-only because the
@@ -1445,9 +1464,10 @@ its use sites before pushing is cheaper than a round trip per platform.
 Blockers: none new. The macOS capacity blocker and the outstanding
 real-machine Day 5 scheduler verification both stand.
 
-Exact next action: push this commit, record the Ubuntu/macOS/Windows CI run
-here, and only then treat the Day 6 gate as closed. Do not begin **Day 7 —
-Release qualification** before that.
+Exact next action: **Day 7 — Release qualification**, subject to the standing
+Day 5 blockers. Day 7 cannot authorise 0.1.0 while macOS cannot clean a
+workspace and while the real-machine scheduler gate is unmet; obtain that
+evidence or record the owner's decision first.
 
 ### Day 7
 
@@ -1504,11 +1524,12 @@ tests/adversarial_tests.rs
 The next implementation agent should:
 
 1. Read `SAFETY.md`, `ACCEPTANCE.md`, `PLANS.md`, `AGENTS.md`, `VISION.md`, `RESEARCH.md`, and this file.
-2. Push the Day 6 commit and record its Ubuntu, macOS, and Windows CI run in
-   the Day 6 section. Until that run is recorded, the Day 6 gate is open and
-   Day 7 must not begin.
-3. Obtain the real-machine Day 5 evidence, or record the owner's decision to
-   accept the gap, before any release qualification.
+2. Obtain the real-machine Day 5 evidence, or record the owner's decision to
+   accept the gap. Day 7 cannot authorise a release without it.
+3. Remember that `cfg`-shaped defects are invisible on this development host:
+   it has a distribution rustc with no `rustup`, so no cross-target standard
+   library exists and `cargo check --target` is unavailable. Audit every
+   helper's `cfg` against its use sites before pushing.
 4. Do not weaken the Day 3 liveness gate to make an executor demonstration
    work. `UnavailableLivenessProver` answers `Unknown` in production by
    design; demonstrations use an injected prover and generated fixtures.
@@ -1539,8 +1560,8 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Day 7 remains outstanding; the Day 5 and Day 6 gates are not met, and
-        macOS cannot perform workspace cleanup
+Reason: Day 7 remains outstanding; the Day 5 gate is not met, and macOS
+        cannot perform workspace cleanup
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.
