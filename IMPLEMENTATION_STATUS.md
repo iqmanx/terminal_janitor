@@ -7,9 +7,8 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Days 1 through 3 complete with their gates passed on Ubuntu,
-                macOS, and Windows; Day 4 implemented locally, its gate
-                pending cross-platform CI
+Current phase:  Days 1 through 4 complete, every gate passed on Ubuntu,
+                macOS, and Windows; Day 5 in progress
 ```
 
 ## Governing state
@@ -974,9 +973,11 @@ Exact next action: close the Day 4 gate with cross-platform CI, then begin
 
 ### Day 4 — Verified executor and threshold loop
 
-Status: **implementation complete locally; Day 4 gate pending cross-platform CI**
+Status: **complete; Day 4 gate passed on Ubuntu, macOS, and Windows**
 
 Date: 2026-08-07
+
+Commit: `04b8fc6` — `feat: add verified autonomous executor`
 
 Files changed:
 
@@ -1095,13 +1096,32 @@ Known limitations:
   one-post-clean-prune-per-run cap.
 - Local evidence is Linux/aarch64.
 
-Blockers: none.
+CI evidence for `04b8fc6` — run `31183103708`,
+`https://github.com/iqmanx/terminal_janitor/actions/runs/31183103708`:
 
-Exact next action: require Ubuntu, macOS, and Windows CI to pass for the Day 4
-commit, record the run, then begin **Day 5 — Activity Protection and Native
-Scheduling**.
+```text
+test (ubuntu-latest)   success   180 unit + 0 + 7 integration; 0 failed; 0 ignored
+test (macos-latest)    success   180 unit + 0 + 4 integration; 0 failed; 0 ignored
+test (windows-latest)  success   175 unit + 0 + 4 integration; 0 failed; 0 ignored
+```
 
-### Days 5–7
+All three jobs ran `cargo fmt --check`, strict Clippy, and `cargo test
+--all-targets`, and all three passed with no ignored test. Clippy passed on CI
+stable first time for this commit; the local toolchain gap recorded under Day 3
+did not bite here.
+
+Blockers: none. The Day 4 gate is closed.
+
+Exact next action: **Day 5 — Activity Protection and Native Scheduling**.
+
+### Day 5 — Activity protection and native scheduling
+
+Status: **in progress**
+
+Started 2026-08-07, immediately after the Day 4 gate closed on run
+`31183103708`.
+
+### Days 6–7
 
 Status: **not started**
 
@@ -1190,7 +1210,7 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Days 5–7 remain outstanding and the Day 4 gate is not yet closed
+Reason: Days 5–7 remain outstanding
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.
