@@ -11,6 +11,10 @@
 //! Enable and disable are both idempotent, so repeating either is safe.
 
 use std::fmt;
+/// Only the unit-file platforms touch the filesystem here; Windows registers
+/// its task through `schtasks` and writes nothing, so the import is gated
+/// exactly like the helpers that use it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

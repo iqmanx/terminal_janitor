@@ -3,10 +3,20 @@
 //! These tests add no product behaviour. They try to break the safety model
 //! from outside the crate, through the real binary and the real filesystem.
 
+// Each helper below is gated to the platforms whose tests use it. The suite is
+// deliberately uneven — driving the real binary needs a fixture that redirects
+// the platform's config and state directories, which only the Unix targets have
+// here — and an ungated helper would be dead code elsewhere under `-D warnings`.
+#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Output};
 
+#[cfg(unix)]
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_terminal_janitor"));
     command.current_dir(home);
@@ -19,6 +29,7 @@ fn command(home: &Path) -> Command {
     command
 }
 
+#[cfg(unix)]
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -33,6 +44,7 @@ fn assert_success(output: &Output) {
 ///
 /// Paths under `ignore` are excluded: those are the places this product is
 /// permitted to write.
+#[cfg(target_os = "linux")]
 fn snapshot(
     root: &Path,
     ignore: &[PathBuf],

@@ -1220,6 +1220,19 @@ Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
   compiled argument array can contain `tmutil`, `snapshot`, `thin`,
   `diskutil`, or `apfs`.
 
+CI evidence — not previously recorded here:
+
+Both Day 5 commits failed CI, and this file did not say so. Runs
+`31185301684` (`20a58a1`) and `31185856996` (`8da2014`) failed
+`test (windows-latest)` at strict Clippy with `unused import: std::fs` in
+`src/scheduler.rs`: the filesystem helpers are gated to the unit-file
+platforms, but their import was not, so Windows saw an unused import under
+`-D warnings`. Ubuntu and macOS passed run `31185856996`. The Windows job
+never reached `cargo test`, so **no Day 5 test evidence exists for Windows at
+all**. The import is gated to match its helpers during the Day 6
+cross-platform cycle recorded below; Day 5's Windows test evidence is
+established there, not here.
+
 ## Gate not met
 
 `PLANS.md` sets the Day 5 gate as: *on all three platforms, enable, manually
@@ -1395,6 +1408,39 @@ Acceptance items supported:
   case variance, and reparse points;
 - I: a corrupt ledger fails closed and is never recreated;
 - N: the result vocabulary is exhaustively named, classified, and coded.
+
+Cross-platform gate:
+
+The first Day 6 run (`31196043742`, commit `600baa2`) passed Ubuntu and failed
+macOS and Windows, both at strict Clippy before any test ran. Two instances of
+one defect class — **an item declared under a wider `cfg` than the items that
+use it** — neither of which a Linux run can see:
+
+```text
+test (macos-latest)    error: function `snapshot` is never used
+                       --> tests/adversarial_tests.rs:36:4
+test (windows-latest)  error: unused import: `std::fs`
+                       --> src\scheduler.rs:14:5
+```
+
+The `std::fs` import is Day 5's, inherited and recorded above. `snapshot` is
+Day 6's: it is used only by the Linux-gated non-interference test, so on macOS
+it is dead code under `-D warnings`.
+
+Fix: gate each item to exactly the platforms that use it — `std::fs` to the
+unit-file platforms alongside its helpers, and in the adversarial suite
+`snapshot`/`BTreeMap`/`PathBuf` to Linux and `command`/`assert_success`/
+`Command`/`Output`/`Path` to Unix. The Windows job had failed on the library
+and never reached the test target, so the adversarial suite's own Windows
+dead-code problems were not in that log; they were found by auditing every use
+site against its declaration and fixed in the same commit rather than by a
+second CI round trip.
+
+Note for later days: the local toolchain is a distribution rustc with no
+`rustup`, so no cross-target standard library is installed and
+`cargo check --target` cannot be used. **`cfg`-shaped defects are invisible
+locally and can only be found by CI.** Auditing every helper's `cfg` against
+its use sites before pushing is cheaper than a round trip per platform.
 
 Blockers: none new. The macOS capacity blocker and the outstanding
 real-machine Day 5 scheduler verification both stand.
