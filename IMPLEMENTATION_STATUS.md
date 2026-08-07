@@ -7,11 +7,11 @@ Repository:     iqmanx/terminal_janitor
 Default branch: main
 Product:        terminal_janitor
 Target version: 0.1.0
-Current phase:  Days 1 through 4 and Day 6 complete, every gate passed on
-                Ubuntu, macOS, and Windows. Day 5 is implemented but its gate
-                is NOT met: it requires real-machine scheduler verification on
-                all three platforms, and macOS cannot clean a workspace at
-                all until snapshot-aware capacity measurement exists.
+Current phase:  Days 0 through 7 implemented. Every daily gate is met on
+                Ubuntu, macOS, and Windows, including the Day 5 real-machine
+                scheduler gate and snapshot-aware macOS capacity. 0.1.0 is
+                built, checksummed, and qualified, but NOT authorised: the
+                tag is the owner's decision and has not been taken.
 ```
 
 ## Governing state
@@ -1120,7 +1120,8 @@ decision on the macOS capacity blocker.
 
 ### Day 5 — Activity protection and native scheduling
 
-Status: **implemented; the Day 5 gate is NOT claimable — see "Gate not met"**
+Status: **complete; Day 5 gate met on Ubuntu, macOS, and Windows — see
+"Gate met"**
 
 Date: 2026-08-07
 
@@ -1231,7 +1232,65 @@ all**. The import is gated to match its helpers during the Day 6
 cross-platform cycle recorded below; Day 5's Windows test evidence is
 established there, not here.
 
-## Gate not met
+## Gate met — 2026-08-07
+
+Both blockers below are resolved and the gate is closed. The text that follows
+is kept as the record of what was open and why.
+
+**The macOS capacity blocker is fixed.** `platform::macos` now reports the
+snapshot-aware figure Foundation publishes as
+`NSURLVolumeAvailableCapacityForImportantUsageKey`, and reports `Confident`
+when it can read it. The figure is never smaller than the raw `statvfs` one, so
+preferring it makes this product believe there is *more* free space and
+therefore clean *less*; the raw figure would invent pressure and delete a
+workspace to relieve it. When the key cannot be read the raw figure is returned
+and `SnapshotUncertain` still blocks workspace cleaning. Reading Foundation's
+exported constants is the only unsafe operation in this crate.
+
+CI evidence — run `31198531027`, on a real Mac:
+
+```text
+macos::tests::this_mac_answers_the_snapshot_aware_question ... ok
+macos::tests::the_resolved_figure_is_never_smaller_than_the_raw_one ... ok
+macos::tests::an_unmeasurable_path_stays_uncertain ... ok
+```
+
+The first of those asserts `Confident`, so macOS is no longer refused workspace
+cleaning. macOS unit tests went from 212 to 215.
+
+**The real-machine scheduler gate is performed**, by the `Scheduler gate`
+workflow, on GitHub's Linux, macOS, and Windows runners — real machines with
+real systemd, launchd, and Task Scheduler, and disposable home directories, so
+the job installs into the real user profile deliberately.
+
+CI evidence — run `31198892109`:
+
+```text
+scheduler-gate (ubuntu-latest)   the schedule fired the binary after 1s
+scheduler-gate (macos-latest)    the schedule fired the binary after 2s
+scheduler-gate (windows-latest)  the schedule fired the binary after 4s
+```
+
+Each platform enabled the schedule, verified `OK_NO_PRESSURE` above threshold
+with no journal written, triggered the installed unit, waited for the journal
+that proves the binary really ran, then disabled and verified removal was clean
+and idempotent.
+
+This is automated real-machine evidence, not manual real-machine evidence, and
+the owner accepted that basis. One part of the `PLANS.md` wording is still not
+reachable in CI: **a scheduled run cannot perform an actual workspace clean**,
+because the 24-hour observation window is a real safety gate and a CI fixture
+is seconds old. Bypassing it would be exactly the policy weakening `AGENTS.md`
+forbids. That half stays proven by the injected-clock executor tests, which do
+reach the clean.
+
+The third item under "Blockers" — whether Windows can report a process working
+directory — is answered: the
+`this_platform_reports_the_working_directory_of_our_own_process` probe passes
+on Windows CI, so Windows can prove liveness and is not a second platform
+blocker.
+
+## Gate not met (historical record)
 
 `PLANS.md` sets the Day 5 gate as: *on all three platforms, enable, manually
 trigger, verify no-op above threshold, verify fixture execution below
@@ -1469,11 +1528,90 @@ Day 5 blockers. Day 7 cannot authorise 0.1.0 while macOS cannot clean a
 workspace and while the real-machine scheduler gate is unmet; obtain that
 evidence or record the owner's decision first.
 
-### Day 7
+### Day 7 — Release qualification
 
-Status: **not started**
+Status: **implemented; 0.1.0 is NOT authorised — see "Release status"**
 
-Follow `PLANS.md` strictly. Do not begin a later day until the current day's mandatory gate passes.
+Date: 2026-08-07
+
+Delivered:
+
+- `install.sh`, `uninstall.sh`, `install.ps1`, and `uninstall.ps1`. `PLANS.md`
+  lists the first three; the fourth exists because `ACCEPTANCE.md` section A
+  requires uninstall to work from a clean account on every supported platform
+  and Windows cannot run `uninstall.sh`;
+- installers that verify SHA256 against `SHA256SUMS` before unpacking anything,
+  install per-user with no administrator rights, replace the binary atomically,
+  never enable scheduling, and never touch configuration or state;
+- uninstallers that remove the schedule *before* the binary — a schedule left
+  pointing at a deleted binary fails every hour forever — and keep
+  configuration and protection state unless `--purge` is given, because
+  deleting the record of which roots a user approved is the one irreversible
+  thing an uninstaller could do;
+- a release workflow building five targets with one `SHA256SUMS` covering all
+  of them, publishing only from a tag;
+- the 1,000-cycle scheduler simulation required by `ACCEPTANCE.md` section M;
+- a qualification workflow: the generated pnpm fixture smoke test on all three
+  platforms, and clean-account install/upgrade/uninstall on all three.
+
+Design decisions worth carrying forward:
+
+- **The Intel macOS artefact is cross-compiled from Apple Silicon.** The
+  `macos-13` job sat queued indefinitely; GitHub is retiring that image. The
+  macOS SDK ships both slices, so this is a first-class native cross-compile
+  and the release no longer depends on a scarce runner class.
+- **A clean account means a clean environment.** Both clean-account jobs failed
+  first on environment leakage rather than on the product: `XDG_CONFIG_HOME`
+  survived `sudo` on Linux, and `Start-Process -Credential` hands the caller's
+  environment block to a process running as a different Windows account. In
+  both cases the product failed closed correctly and the harness was wrong.
+- **The Windows test asks where configuration landed rather than asserting a
+  path**, because Windows resolves it through the known-folder API rather than
+  the environment. "It went inside this account's own profile" is both easier
+  to establish and the stronger claim.
+
+One product defect was found, by smoke-testing the new uninstaller:
+
+`disable` returned `FAILED_CONFIGURATION` and exit 2 on any machine without
+the scheduler tool installed — a container, a minimal distribution, or the
+Termux userland this was found on. The `tolerate_failure` flag covered a
+command that ran and reported failure but not one that could not be started at
+all, so there was no way to remove a schedule or uninstall cleanly.
+`ACCEPTANCE.md` section J requires disable to be idempotent, and the module's
+own note says removing the unit files is what disables the schedule. Fixed,
+with a regression test for the missing-tool case and its mirror image: enable
+still fails loudly, because enabling genuinely does require the tool.
+
+Automated test evidence (local Linux aarch64, Ubuntu 26.04 under proot):
+
+- `cargo fmt --check`, strict Clippy, and `cargo test --all-targets` all pass;
+- 233 tests: 219 unit, 7 adversarial, 7 CLI integration, 0 failed, 0 ignored.
+
+Known limitations:
+
+- **The 1,000-cycle simulation is slow on Windows.** It dominates that job at
+  roughly 6.5 minutes, against 11 seconds on Ubuntu and 5 on macOS, because
+  every cycle takes a real file lock and commits real SQLite transactions. It
+  is kept at full size: it is a mandatory acceptance item and it is the only
+  thing exercising the seven-day cooldown across simulated time.
+- **The installers' download-and-verify path cannot be exercised until a
+  release exists.** `--from` proves the install, replace, and verify-the-binary
+  path, and the release workflow proves the checksums are correct and complete,
+  but no test has yet downloaded an artefact and checked it against a published
+  `SHA256SUMS`. That closes on the first tag, and the acceptance box for it is
+  ticked on the checksum evidence only.
+- The Windows reparse-point limitation recorded under Day 6 still stands.
+
+Blockers: none outstanding for Day 7 itself.
+
+Exact next action: the owner decides whether to tag 0.1.0. Everything Day 7
+builds is in place and green; the remaining judgement is theirs.
+
+### Day 7 gate
+
+`PLANS.md` sets it as: every item in `ACCEPTANCE.md` passes. The evidence basis
+for each ticked item, including the four that rest on source inspection rather
+than a test, is recorded at the top of `ACCEPTANCE.md`.
 
 ## Current repository contents
 
@@ -1560,8 +1698,13 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 
 ```text
 0.1.0 release authorised: NO
-Reason: Day 7 remains outstanding; the Day 5 gate is not met, and macOS
-        cannot perform workspace cleanup
+Reason: Every gate is met and every artefact is built and checksummed, but
+        tagging is the owner's decision and has not been taken. Two items
+        remain honestly short of proof: no test has yet downloaded a
+        published artefact and checked it against a published SHA256SUMS,
+        which is only possible once a release exists; and CI cannot
+        distinguish the Windows reparse-point test asserting from it
+        declining its fixture.
 ```
 
 Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.

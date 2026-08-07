@@ -518,12 +518,19 @@ fn a_windows_reparse_point_is_seen_as_a_link_and_grants_no_second_identity() {
     std::fs::create_dir(&target).unwrap();
     let link = home.path().join("linked-projects");
 
-    if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
-        // Creating a reparse point needs privilege this host has not granted.
-        // That is a fixture limitation, not a relaxed safety rule: the
-        // production refusal is unchanged and its Unix twin still runs.
-        return;
-    }
+    // Deliberately not skipped when the fixture cannot be created. A skipped
+    // body and a passing body are both reported as one passing test, so a
+    // graceful return here would make `ACCEPTANCE.md`'s reparse-point item
+    // unprovable — the tick would rest on "it probably ran". Creating a
+    // directory symlink needs SeCreateSymbolicLinkPrivilege, which CI runners
+    // and developer machines in Developer Mode both have; without it this
+    // fails loudly and says why, which is the honest outcome.
+    std::os::windows::fs::symlink_dir(&target, &link).expect(
+        "could not create a directory reparse point: this needs \
+         SeCreateSymbolicLinkPrivilege, granted by Developer Mode or an \
+         elevated shell. The reparse-point safety property cannot be proven \
+         without it, so this test refuses to pass silently.",
+    );
 
     assert!(
         std::fs::symlink_metadata(&link)
