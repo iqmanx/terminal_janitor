@@ -49,21 +49,21 @@ pub enum CapacityConfidence {
 
 /// Reports whether free space on the volume containing `path` is unambiguous.
 ///
-/// macOS is the reason this exists. On APFS the reported available figure can
-/// include purgeable space and space held by Time Machine local snapshots, and
-/// this product has no snapshot-aware measurement. `ACCEPTANCE.md` section K
-/// requires that unresolved ambiguity block workspace cleaning rather than be
-/// guessed at, so macOS reports `SnapshotUncertain` and the executor refuses
-/// workspace cleans there. `terminal_janitor` never deletes or thins a
-/// snapshot under any circumstances.
+/// macOS is the reason this exists. On APFS the raw available figure excludes
+/// purgeable space and space held by Time Machine local snapshots, so it does
+/// not describe what a caller would actually get. [`macos`] resolves that
+/// through Foundation and reports `Confident` when it succeeds; when it cannot,
+/// the ambiguity is unresolved and `SnapshotUncertain` blocks workspace
+/// cleaning, as `ACCEPTANCE.md` section K requires. `terminal_janitor` never
+/// deletes or thins a snapshot under any circumstances.
 pub fn capacity_confidence(path: &Path) -> CapacityConfidence {
-    let _ = path;
     #[cfg(target_os = "macos")]
     {
-        CapacityConfidence::SnapshotUncertain
+        macos::capacity_confidence(path)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = path;
         CapacityConfidence::Confident
     }
 }
