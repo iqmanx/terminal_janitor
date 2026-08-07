@@ -130,6 +130,10 @@ pub fn disable(
 
 /// Writes `contents` to `path`, creating parents. Rewriting an identical file
 /// is what makes `enable` idempotent.
+///
+/// Only the unit-file platforms use this; Windows registers its task through
+/// `schtasks` and writes nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_file(path: &Path, contents: &str) -> Result<(), ScheduleError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ScheduleError::Write {
@@ -144,6 +148,7 @@ fn write_file(path: &Path, contents: &str) -> Result<(), ScheduleError> {
 }
 
 /// Removes a file, treating "already absent" as success.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn remove_file(path: &Path) -> Result<bool, ScheduleError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -482,6 +487,8 @@ mod tests {
             }
         }
 
+        /// Only the systemd tests exercise a failing scheduler command.
+        #[cfg(target_os = "linux")]
         fn failing() -> Self {
             Self {
                 exit_code: 1,
