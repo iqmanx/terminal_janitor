@@ -1698,14 +1698,34 @@ Do not state that a platform, test, or acceptance gate passed without evidence.
 ## Release status
 
 ```text
-0.1.0 release authorised: NO
-Reason: Every gate is met and every artefact is built and checksummed, but
-        tagging is the owner's decision and has not been taken. Two items
-        remain honestly short of proof: no test has yet downloaded a
-        published artefact and checked it against a published SHA256SUMS,
-        which is only possible once a release exists; and CI cannot
-        distinguish the Windows reparse-point test asserting from it
-        declining its fixture.
+0.1.0 release authorised: YES
+Authorised by: the owner, 2026-08-08
+Basis: every one of the 135 items in ACCEPTANCE.md is ticked and supported by
+       recorded evidence; Days 0 through 7 each have a met gate; and CI,
+       Scheduler gate, Qualification, and Release are all green on the same
+       commit (15859db), with all five artefacts built and checksummed by
+       run 31253406267.
 ```
 
-Do not tag or publish 0.1.0 until every applicable gate in `ACCEPTANCE.md` is supported by recorded evidence.
+Known at the moment of authorisation, and not resolved by it:
+
+- **The publish path has never executed.** It fires only on a tag, so the
+  first `v0.1.0` tag is also the first run of the release-creation step. Its
+  failure mode is a failed workflow, not a bad artefact: the artefacts
+  themselves are built and checksummed by the same run that publishes them.
+- **No test has downloaded a published artefact and verified it against a
+  published `SHA256SUMS`.** `install.sh --from` and `install.ps1 -From` prove
+  the install, atomic replace, and verify-the-binary path, and the release
+  workflow proves the sums are correct and complete, but the download-and-
+  verify path in the installers is exercised for the first time by whoever
+  installs 0.1.0. The `ACCEPTANCE.md` section A checksum item is ticked on
+  generation evidence only.
+- **A scheduled run has never performed an actual workspace clean on real
+  hardware.** The schedule is proven to fire on all three platforms and the
+  clean is proven by injected-clock tests, but those two halves have never met
+  in one live run, because the 24-hour observation window is a real safety gate
+  and a CI fixture is seconds old. Bypassing it would be the policy weakening
+  `AGENTS.md` forbids.
+
+None of the three is a defect. They are the edge of what has been proven, and
+they are recorded here so the release is not read as claiming more than it did.
