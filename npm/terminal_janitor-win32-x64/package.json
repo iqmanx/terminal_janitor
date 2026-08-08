@@ -1,0 +1,20 @@
+{
+  "name": "terminal_janitor-win32-x64",
+  "version": "0.0.0",
+  "description": "x86_64-pc-windows-msvc binary for terminal_janitor",
+  "homepage": "https://github.com/iqmanx/terminal_janitor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iqmanx/terminal_janitor.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "preferUnplugged": true
+}

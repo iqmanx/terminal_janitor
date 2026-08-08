@@ -67,19 +67,70 @@ administrator rights, and nothing is scheduled until you ask for it.
 Linux and macOS:
 
 ```sh
-./install.sh                          # latest release into ~/.local/bin
-./install.sh --version v0.1.0         # an exact release
-./install.sh --prefix "$HOME/bin"     # somewhere else
+curl -fsSL https://raw.githubusercontent.com/iqmanx/terminal_janitor/main/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-.\install.ps1
+irm https://raw.githubusercontent.com/iqmanx/terminal_janitor/main/install.ps1 | iex
 ```
 
-Release archives are verified against `SHA256SUMS` before they are unpacked; a
-missing or mismatched checksum refuses the install rather than continuing.
+That downloads the release archive for your platform, verifies it against
+`SHA256SUMS`, and places one binary in `~/.local/bin`
+(`%LOCALAPPDATA%\Programs\terminal_janitor` on Windows). A missing or
+mismatched checksum refuses the install rather than continuing.
+
+Piping a script into a shell deserves suspicion, so: read it first if you like,
+because it is the same script either way.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/iqmanx/terminal_janitor/main/install.sh | less
+```
+
+It never asks for root, never writes outside your home directory, never enables
+scheduling, and never touches configuration or protection state.
+
+If you have the repository cloned, run it from there instead, and pass options
+directly:
+
+```sh
+./install.sh                          # latest release into ~/.local/bin
+./install.sh --version v0.1.0         # an exact release
+./install.sh --prefix "$HOME/bin"     # somewhere else
+./install.sh --from ./path/to/binary  # install a binary you already built
+```
+
+The one-liner takes the same options after `-s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/iqmanx/terminal_janitor/main/install.sh | sh -s -- --prefix "$HOME/bin"
+```
+
+### With npm or pnpm
+
+Anyone this product is for already has a JavaScript package manager installed,
+so there is one:
+
+```sh
+npm install -g terminal_janitor
+pnpm add -g terminal_janitor
+```
+
+The published package is a wrapper with no logic in it. It selects the native
+binary from the one platform package matching your `os` and `cpu`, and passes
+arguments, stdio, and exit codes straight through. Nothing is downloaded during
+installation and no install script runs, so this works under `--ignore-scripts`
+and against a registry mirror. Every package carries an npm provenance
+attestation tying it to the workflow run and commit that built it.
+
+The binaries are the same artefacts the installers download, repackaged by the
+release workflow — not a second build.
+
+Run `terminal_janitor disable` **before** `npm rm -g terminal_janitor`. Removing
+the package deletes the binary the schedule points at, and npm has no reliable
+way to run the product's own uninstall step first. `uninstall.sh` gets this
+right on your behalf; a package manager cannot.
 
 Removing it again:
 

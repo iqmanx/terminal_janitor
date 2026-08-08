@@ -126,3 +126,99 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --notes "Checksums are in SHA256SUMS. Scheduling is opt-in: run \`terminal_janitor enable\`." \
             dist/*
+
+  # The npm channel repackages the artefacts this run already built and
+  # checksummed; it never compiles anything of its own. It runs after the
+  # GitHub release so a version can never exist on npm without the release and
+  # checksums it was cut from.
+  #
+  # Node and npm are preinstalled on the runner image, so no action is needed
+  # to provide them.
+  npm:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm reads an OIDC token directly to attach a provenance attestation,
+      # which is what lets anyone verify these packages came from this workflow
+      # at this commit.
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-artefacts
+          path: dist
+
+      # The same refusal the installers make: nothing is unpacked before its
+      # checksum is confirmed, even though this run produced it minutes ago.
+      - name: verify the artefacts before unpacking
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check SHA256SUMS
+
+      - name: place each binary in its platform package
+        run: |
+          set -euo pipefail
+
+          # Unpacks one release archive into the platform package that ships it.
+          # Every call names a target the build matrix above actually produces,
+          # and asserts the executable landed, so a renamed or missing artefact
+          # fails this job rather than publishing an empty package.
+          place() {
+            target="$1" package="$2" kind="$3"
+            dest="npm/$package/bin"
+            mkdir -p "$dest"
+            if [ "$kind" = zip ]; then
+              unzip -o "dist/terminal_janitor-$target.zip" \
+                terminal_janitor.exe -d "$dest"
+              test -f "$dest/terminal_janitor.exe"
+            else
+              tar -xzf "dist/terminal_janitor-$target.tar.gz" \
+                -C "$dest" terminal_janitor
+              chmod 755 "$dest/terminal_janitor"
+              test -x "$dest/terminal_janitor"
+            fi
+            echo "$package <- terminal_janitor-$target"
+          }
+
+          place x86_64-unknown-linux-gnu  terminal_janitor-linux-x64    tar
+          place aarch64-unknown-linux-gnu terminal_janitor-linux-arm64  tar
+          place x86_64-apple-darwin       terminal_janitor-darwin-x64   tar
+          place aarch64-apple-darwin      terminal_janitor-darwin-arm64 tar
+          place x86_64-pc-windows-msvc    terminal_janitor-win32-x64    zip
+
+      # One version across every package, taken from the tag, with the wrapper's
+      # optional dependencies pinned exactly. A range would let npm pair a
+      # wrapper with a platform binary it was never released against.
+      - name: stamp the version from the tag
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for package in terminal_janitor-linux-x64 terminal_janitor-linux-arm64 \
+                         terminal_janitor-darwin-x64 terminal_janitor-darwin-arm64 \
+                         terminal_janitor-win32-x64; do
+            (cd "npm/$package" && npm pkg set "version=$version")
+            (cd npm/terminal_janitor &&
+               npm pkg set "optionalDependencies.$package=$version")
+          done
+          (cd npm/terminal_janitor && npm pkg set "version=$version")
+          (cd npm/terminal_janitor && npm pkg get version optionalDependencies)
+
+      # Platform packages first. The wrapper depends on them by exact version,
+      # so publishing it first would leave a window where installing it
+      # resolves nothing runnable.
+      - name: publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > ~/.npmrc
+          trap 'rm -f ~/.npmrc' EXIT
+          for package in terminal_janitor-linux-x64 terminal_janitor-linux-arm64 \
+                         terminal_janitor-darwin-x64 terminal_janitor-darwin-arm64 \
+                         terminal_janitor-win32-x64; do
+            npm publish "npm/$package" --provenance --access public
+          done
+          npm publish npm/terminal_janitor --provenance --access public

@@ -1,0 +1,20 @@
+{
+  "name": "terminal_janitor-linux-x64",
+  "version": "0.0.0",
+  "description": "x86_64-unknown-linux-gnu binary for terminal_janitor",
+  "homepage": "https://github.com/iqmanx/terminal_janitor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iqmanx/terminal_janitor.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "preferUnplugged": true
+}

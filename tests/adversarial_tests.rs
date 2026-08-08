@@ -290,6 +290,136 @@ fn case_differences_never_produce_a_second_identity() {
     );
 }
 
+/// Installing through npm or pnpm puts the product's own binary inside a
+/// `node_modules` tree, which is precisely the shape this product cleans. A
+/// janitor that could delete itself would take its own schedule down with it,
+/// so a global install is put directly in harm's way here: it sits beneath an
+/// approved root, carries every workspace marker, and the run is forced into
+/// pressure so the planner is looking for anything it may touch.
+///
+/// The binary must survive, and no action may name the directory holding it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_global_node_modules_install_is_never_cleaned_by_itself() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("projects");
+
+    // The layout `npm install -g` and `pnpm add -g` produce, placed under the
+    // approved root rather than beside it: the worst case, not the usual one.
+    let install = root.join("node_modules/terminal_janitor-linux-x64");
+    std::fs::create_dir_all(install.join("bin")).unwrap();
+    let installed_binary = install.join("bin/terminal_janitor");
+    std::fs::write(&installed_binary, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&installed_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Every marker a real workspace has, so nothing but the safety gates can
+    // be what saves it.
+    for marker in ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"] {
+        std::fs::write(install.join(marker), b"fixture").unwrap();
+    }
+    std::fs::write(
+        root.join("node_modules/package.json"),
+        br#"{"name":"global-root"}"#,
+    )
+    .unwrap();
+
+    let fake_bin = home.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let invocations = home.path().join("invocations.log");
+    for executable in ["pnpm", "git", "node", "npm"] {
+        let path = fake_bin.join(executable);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '{executable} %s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = \"--version\" ]; then echo 11.2.3; fi\n",
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    assert_success(
+        &command(home.path())
+            .args([
+                "init",
+                "--root",
+                root.to_str().unwrap(),
+                "--pnpm",
+                fake_bin.join("pnpm").to_str().unwrap(),
+                // Unreachable thresholds keep the run under pressure for its
+                // whole length, so it never stops early for lack of motive.
+                "--minimum-free",
+                "900000GiB",
+                "--target-free",
+                "950000GiB",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let scan = command(home.path())
+        .env("PATH", &fake_bin)
+        .args(["scan", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&scan);
+
+    // The mechanism that saves it: discovery does not descend into
+    // `node_modules`, so a global install is never a workspace candidate in the
+    // first place and never reaches the gates at all.
+    let scanned: serde_json::Value = serde_json::from_slice(&scan.stdout).unwrap();
+    assert!(
+        scanned["registered"].as_array().unwrap().is_empty(),
+        "an install inside node_modules must not register as a workspace: {scanned:?}"
+    );
+
+    let check = command(home.path())
+        .env("PATH", &fake_bin)
+        .args(["check", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+
+    // Without this the rest would pass vacuously: the run has to have been
+    // under real pressure and actually executed something for "it left the
+    // install alone" to mean anything.
+    assert!(
+        !report["actions"].as_array().unwrap().is_empty(),
+        "the run must have executed actions for this test to prove anything: {report:?}"
+    );
+
+    assert!(
+        installed_binary.exists(),
+        "the running product's own binary must survive a pressured run"
+    );
+    assert_eq!(
+        std::fs::read(&installed_binary).unwrap(),
+        b"#!/bin/sh\nexit 0\n",
+        "the product's own binary must not be rewritten"
+    );
+
+    let install_path = install.to_str().unwrap();
+    for action in report["actions"].as_array().into_iter().flatten() {
+        let path = action["path"].as_str().unwrap_or_default();
+        assert!(
+            !path.starts_with(install_path),
+            "no action may target the product's own install: {action:?}"
+        );
+    }
+
+    // The gates must hold in the adapter layer too: pnpm is never handed the
+    // directory the product is installed in.
+    let log = std::fs::read_to_string(&invocations).unwrap_or_default();
+    assert!(
+        !log.contains(install_path),
+        "pnpm must never be invoked against the product's own install; log was {log:?}"
+    );
+}
+
 /// `history` must stay readable and truthful when the ledger has never been
 /// written, rather than inventing a run or failing obscurely.
 #[cfg(target_os = "linux")]

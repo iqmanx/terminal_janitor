@@ -1,1 +1,9 @@
 /target
+
+# The release workflow copies built executables into the npm platform packages
+# just before publishing. They are never committed: every artefact is built by
+# CI from a tagged commit, so the published checksums describe exactly what the
+# repository contained.
+/npm/*/bin/terminal_janitor
+/npm/*/bin/terminal_janitor.exe
+/npm/*/*.tgz

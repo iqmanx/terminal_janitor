@@ -1729,3 +1729,48 @@ Known at the moment of authorisation, and not resolved by it:
 
 None of the three is a defect. They are the edge of what has been proven, and
 they are recorded here so the release is not read as claiming more than it did.
+
+## Post-0.1.0 — install channels
+
+Distribution only. No product behaviour changed, no gate was reopened, and the
+binary is the same artefact in every channel.
+
+- **`curl | sh` one-liner.** `install.sh` was already self-contained — it
+  sources nothing, reads no stdin, and uses no script-relative paths — so this
+  is a `README.md` change and no script change. Checksum verification is
+  unaffected: piping alters how the script is fetched, not what it does.
+- **npm and pnpm.** `npm/` holds a wrapper package and five platform packages
+  gated by `os`/`cpu`, one per target in the release matrix. The wrapper holds
+  no logic; it resolves the platform package and passes arguments, stdio, and
+  exit codes through unchanged, because the exit codes are a contract the
+  scheduler reads. There is no install script and nothing is downloaded during
+  installation.
+- **The `npm` job in `release.yml`** repackages the artefacts that run already
+  built and checksummed. It re-runs `sha256sum --check` before unpacking
+  anything, stamps one version from the tag with the wrapper's optional
+  dependencies pinned exactly, and publishes platform packages before the
+  wrapper so the wrapper never resolves to something unpublished. It runs after
+  the GitHub release, so a version cannot exist on npm without the release it
+  was cut from.
+
+New proof: `a_global_node_modules_install_is_never_cleaned_by_itself` puts a
+global install beneath an approved root, gives it every workspace marker, and
+forces a pressured run. The install survives untouched. The mechanism is that
+discovery does not descend into `node_modules`, so it is never a workspace
+candidate and never reaches the gates. The test asserts the run executed actions
+and that pnpm ran, so it cannot pass by doing nothing.
+
+Known, and not resolved here:
+
+- **The npm publish path has never executed.** Like the release path before it,
+  it fires only on a tag. It was proven locally instead: the workflow's own
+  verify, place, and stamp steps were run against fixture artefacts, both
+  tarballs were confirmed to contain the executable, and `npm install -g` from
+  the packed tarballs produced a working `terminal_janitor` that reported
+  `0.1.0` and returned exit code 6 for a failed root validation, matching the
+  binary invoked directly.
+- **`NPM_TOKEN` is not yet configured**, so the job will fail at publish until
+  the secret exists.
+- **The repository has no licence file.** Publishing to a public registry
+  without one leaves the package all-rights-reserved by default, which is a
+  legal gap rather than a technical one, and it is not resolved by this change.

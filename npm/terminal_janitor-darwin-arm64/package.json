@@ -1,0 +1,20 @@
+{
+  "name": "terminal_janitor-darwin-arm64",
+  "version": "0.0.0",
+  "description": "aarch64-apple-darwin binary for terminal_janitor",
+  "homepage": "https://github.com/iqmanx/terminal_janitor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iqmanx/terminal_janitor.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "preferUnplugged": true
+}
