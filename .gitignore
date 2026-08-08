@@ -7,3 +7,7 @@
 /npm/*/bin/terminal_janitor
 /npm/*/bin/terminal_janitor.exe
 /npm/*/*.tgz
+
+# The root LICENSE is copied into each package at publish time for the same
+# reason. One licence is tracked, at the root; the copies are build output.
+/npm/*/LICENSE

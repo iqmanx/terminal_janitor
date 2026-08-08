@@ -2,6 +2,7 @@
 name = "terminal_janitor"
 version = "0.1.1"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 # Command-line parsing for the implemented Day 1 status command only.

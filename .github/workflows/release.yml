@@ -189,6 +189,19 @@ jobs:
           place aarch64-apple-darwin      terminal_janitor-darwin-arm64 tar
           place x86_64-pc-windows-msvc    terminal_janitor-win32-x64    zip
 
+      # npm bundles a LICENSE automatically, but only one found inside the
+      # package directory, and this repository keeps a single licence at the
+      # root. Without this copy every package would declare `"license": "MIT"`
+      # while shipping no licence text at all: a claim with nothing behind it.
+      - name: give every package the licence it declares
+        run: |
+          set -euo pipefail
+          test -f LICENSE
+          for package in npm/*/; do
+            cp LICENSE "$package/LICENSE"
+          done
+          ls npm/*/LICENSE
+
       # One version across every package, taken from the tag, with the wrapper's
       # optional dependencies pinned exactly. A range would let npm pair a
       # wrapper with a platform binary it was never released against.

@@ -15,6 +15,7 @@
     "type": "git",
     "url": "git+https://github.com/iqmanx/terminal_janitor.git"
   },
+  "license": "MIT",
   "bin": {
     "terminal_janitor": "bin/terminal_janitor.js"
   },
