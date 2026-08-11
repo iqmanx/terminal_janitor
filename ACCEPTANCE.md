@@ -11,6 +11,8 @@ adversarial, and 7 CLI integration tests — passing on Ubuntu, macOS, and
 Windows, plus the three real-machine workflows: `Scheduler gate` (enable,
 trigger, no-op, disable on each platform), `Qualification` (generated pnpm
 fixture and clean-account install), and `Release` (five targets, checksummed).
+The npm channel items are carried by `.github/scripts/npm-channel-check.js`,
+which runs in `CI` and exercises the published wrapper against a stub binary.
 `IMPLEMENTATION_STATUS.md` records the run identifiers per day.
 
 Four items rest on source and schema inspection rather than on a test that
@@ -39,6 +41,10 @@ rather than left to look like the rest:
 - [x] Install and uninstall work from clean user accounts.
 - [x] Upgrade preserves configuration and protection state.
 - [x] Scheduling is not silently enabled during installation.
+- [x] The npm wrapper adds no behaviour: arguments, stdio, exit codes, and a killing signal reach the caller unchanged.
+- [x] The supported platform list is identical in the wrapper, the platform packages, and the release workflow.
+- [x] The npm packages repackage the checksummed release artefacts and never compile a second binary.
+- [ ] The npm channel has published a release. Blocked twice over: provenance needs a public source repository and this one is private, and no `NPM_TOKEN` secret exists. The release workflow now refuses before publishing rather than discovering either at the last step.
 
 ## B. Threshold behaviour
 
