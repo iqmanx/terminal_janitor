@@ -145,6 +145,66 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Both conditions this job cannot satisfy are knowable before anything is
+      # downloaded, and both would otherwise surface at the very last step —
+      # after the GitHub release exists, leaving a tagged version the README
+      # says is installable from npm and is not. They are checked first, and
+      # the failure names the fix rather than the symptom.
+      - name: refuse before the registry is touched
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # The push payload carries the repository's visibility, so this costs
+          # no API call and cannot be affected by the token above.
+          VISIBILITY: ${{ github.event.repository.visibility }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::the NPM_TOKEN secret is empty or unset, so the" \
+              "publish step would fail with ENEEDAUTH. Add a granular npm" \
+              "automation token with publish rights to the repository" \
+              "secrets, or delete this job." >&2
+            exit 1
+          fi
+
+          # npm signs provenance into a public transparency log and requires
+          # the source repository to be public to do it. `README.md` promises
+          # every package carries that attestation, so publishing without it
+          # here would make the promise false rather than make the job pass.
+          if [ "${VISIBILITY}" != public ]; then
+            echo "::error::provenance requires a public source repository," \
+              "and this one is ${VISIBILITY}. Either make the repository" \
+              "public before tagging, or drop --provenance here and remove" \
+              "the attestation claim from README.md and the npm README." >&2
+            exit 1
+          fi
+
+      # The npm version is what a user sees; the binary reports its own. A tag
+      # that disagrees with Cargo.toml would ship `terminal_janitor@0.2.0`
+      # whose `--version` says something else, and nothing downstream would
+      # notice.
+      - name: check the tag against the crate version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          crate="$(awk '
+            /^\[/ { table = $0 }
+            table == "[package]" && /^version[[:space:]]*=/ {
+              match($0, /"[^"]+"/)
+              print substr($0, RSTART + 1, RLENGTH - 2)
+              exit
+            }
+          ' Cargo.toml)"
+          test -n "$crate"
+          if [ "$version" != "$crate" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} would publish npm version" \
+              "${version}, but Cargo.toml says ${crate}. Tag the crate" \
+              "version, or bump the crate before tagging." >&2
+            exit 1
+          fi
+          echo "tag and crate agree on ${version}"
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-artefacts
@@ -229,9 +289,29 @@ jobs:
           set -euo pipefail
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > ~/.npmrc
           trap 'rm -f ~/.npmrc' EXIT
+          version="${GITHUB_REF_NAME#v}"
+
+          # A publish that fails partway through leaves some packages on the
+          # registry and some not, and npm refuses to overwrite a version that
+          # already exists. Without this check the re-run needed to finish the
+          # set is exactly the run npm rejects, and the only way out is a new
+          # version for a release that was never the problem. Skipping what is
+          # already there makes this step resumable; it still cannot overwrite
+          # anything, because a version already on the registry is never
+          # republished.
+          release_package() {
+            package="$1"
+            name="$(node -p "require('./npm/$package/package.json').name")"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published; leaving it untouched"
+              return 0
+            fi
+            npm publish "npm/$package" --provenance --access public
+          }
+
           for package in terminal_janitor-linux-x64 terminal_janitor-linux-arm64 \
                          terminal_janitor-darwin-x64 terminal_janitor-darwin-arm64 \
                          terminal_janitor-win32-x64; do
-            npm publish "npm/$package" --provenance --access public
+            release_package "$package"
           done
-          npm publish npm/terminal_janitor --provenance --access public
+          release_package terminal_janitor

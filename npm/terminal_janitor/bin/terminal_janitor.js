@@ -14,6 +14,7 @@
 'use strict';
 
 const { spawnSync } = require('node:child_process');
+const os = require('node:os');
 const path = require('node:path');
 
 // Every key is a `${process.platform} ${process.arch}` pair, and every value is
@@ -49,9 +50,12 @@ function resolveBinary() {
     manifest = require.resolve(`${packageName}/package.json`);
   } catch {
     throw new Error(
-      `the ${packageName} package is missing. It is an optional dependency, ` +
-        'so installing with --no-optional or --omit=optional skips it; ' +
-        'reinstall without that flag.',
+      `the ${packageName} package is not installed. It is an optional ` +
+        'dependency, so --no-optional and --omit=optional skip it, and a ' +
+        'package manager also skips it when the machine does not match its ' +
+        'os, cpu, or C library. The Linux artefacts are linked against ' +
+        'glibc, so a musl system such as Alpine has none. Reinstall without ' +
+        'those flags on a supported system.',
     );
   }
   return path.join(path.dirname(manifest), 'bin', executable);
@@ -76,6 +80,16 @@ if (result.error) {
 // would invent an outcome. Re-raise the same signal instead.
 if (result.signal) {
   process.kill(process.pid, result.signal);
+
+  // Re-raising ends the process for every signal whose default disposition is
+  // to terminate, so the lines below are normally unreachable. They are not
+  // dead code: Node ignores a few signals by default — SIGPIPE among them —
+  // and there the call returns, the script runs off its end, and the wrapper
+  // would exit 0 for a binary that was killed. That is precisely the invented
+  // outcome this branch exists to prevent, so fall back to the shell's own
+  // convention of 128 plus the signal number.
+  const number = os.constants.signals[result.signal];
+  process.exit(number === undefined ? 1 : 128 + number);
 } else {
   process.exit(result.status === null ? 1 : result.status);
 }

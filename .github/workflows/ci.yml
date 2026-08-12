@@ -30,3 +30,15 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo test
         run: cargo test --all-targets
+
+  # The npm channel is published only from a tag, so nothing else would notice
+  # a broken wrapper or a platform package the workflow forgot until the
+  # version carrying the mistake was already on the registry and unpublishable
+  # over. This job needs no Rust and no network: Node is preinstalled on the
+  # runner image, and the check installs its own stub binary.
+  npm-channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: check the npm channel
+        run: node .github/scripts/npm-channel-check.js
