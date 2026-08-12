@@ -16,7 +16,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # SHA is the head of the upstream `stable` branch as of 2026-08-02
       # (dtolnay/rust-toolchain publishes no release tags for it). The branch
       # ref previously supplied the toolchain choice, so it is now explicit.
@@ -39,6 +39,6 @@ jobs:
   npm-channel:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: check the npm channel
         run: node .github/scripts/npm-channel-check.js
