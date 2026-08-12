@@ -8,9 +8,9 @@ Its first product goal is deliberately narrow:
 
 The v0.1 product is a single Rust binary containing the Engine and CLI. It runs on Linux, macOS, and Windows, uses the operating system's native user scheduler, and requires no VPS, account, cloud database, GUI, MCP server, or permanent daemon.
 
-## Locked seven-day scope
+## Scope
 
-The first release supports:
+`terminal_janitor` supports:
 
 - configurable `minimum_free` and `target_free` thresholds;
 - a fast no-pressure exit;
@@ -24,7 +24,7 @@ The first release supports:
 - fail-closed shortfall reporting when safe actions are exhausted;
 - human-readable and JSON output.
 
-The first release does **not** support generic cache cleaning, arbitrary path deletion, user-defined cleanup recipes, Docker cleanup, Cargo cleanup, Python virtual-environment removal, Downloads cleaning, GUI, MCP, Claude Code, Codex, cloud services, or AI-directed deletion.
+It does **not** support generic cache cleaning, arbitrary path deletion, user-defined cleanup recipes, Docker cleanup, Cargo cleanup, Python virtual-environment removal, Downloads cleaning, GUI, MCP, Claude Code, Codex, cloud services, or AI-directed deletion.
 
 ## Core invariant
 
@@ -132,7 +132,7 @@ terminal_janitor enable      # hourly, per-user
 terminal_janitor disable     # stops it again
 ```
 
-## Current CLI (Day 5)
+## Commands
 
 ```text
 terminal_janitor init --root <path> [--root <path> ...] [--pnpm <path>]
@@ -208,7 +208,7 @@ process liveness — and the first refusal is the one reported. Plans carry an
 immutable plan ID, a policy hash, and a 15-minute expiry, and no plan may
 contain more than two workspace cleans.
 
-Day 3 asks Git for worktree state with a fixed read-only argument array
+Worktree state comes from Git through a fixed read-only argument array
 (`git --no-optional-locks status --porcelain=v1 --untracked-files=all`), run
 directly with no shell. Empty output is clean; any line is dirty; a missing
 Git, a non-zero exit, a timeout, or truncated output is `unknown`, and unknown
@@ -321,8 +321,8 @@ signs, whitespace, unknown units, overflow, zero `minimum_free`, and a
 accepted or interpreted as `GiB`. An invalid existing file fails closed with
 `FAILED_CONFIGURATION`; it never falls back to defaults.
 
-`approved_roots` is optional and defaults to an empty list, so Day 1
-configuration files remain valid unchanged. When present it must contain
+`approved_roots` is optional and defaults to an empty list, so configuration
+files that predate it remain valid unchanged. When present it must contain
 absolute paths; entries are sorted and de-duplicated deterministically, and a
 relative entry fails closed. `init` is the supported way to populate it. No
 current command performs cleanup based on this list.
@@ -417,47 +417,24 @@ When relevant exclusions exist, `result` is
 }
 ```
 
-Pressure uses `PRESSURE_DETECTED`; Day 1 never claims that a target was
+Pressure uses `PRESSURE_DETECTED`; `status` never claims that a target was
 restored. Configuration failures exit 2, and storage-measurement failures exit
 3. JSON-mode failures remain valid JSON.
 
-## Development loop
-
-Every implementation stage follows:
-
-```text
-Define -> implement -> test -> analyse -> improve -> retest -> document -> commit
-```
-
-Complexity is introduced only when a demonstrated failure requires it. Optional features are cut before any safety gate is weakened.
-
-## Current state
-
-Days 1 through 3 are complete, each closed by CI green on Ubuntu, macOS, and
-Windows.
-
-Day 4 added the verified executor: the per-volume lock, the run and action
-journal, direct execution with compiled argument arrays, pre-action proof and
-identity revalidation, measurement after every action, stop-at-target, the
-safe-shortfall result, the two-workspace cap, own-state cleanup, the one
-permitted post-clean store prune, and `check`, `clean`, and `history`.
-
-Day 5 adds real process liveness, native per-user scheduling, and snapshot-aware
-macOS capacity. Its gate is met: the schedule was enabled, triggered, observed
-firing the binary, and disabled on real Linux, macOS, and Windows machines, and
-macOS now resolves the purgeable/snapshot ambiguity through Foundation instead
-of refusing to clean.
-
-Day 6 is adversarial hardening — the safety model attacked from outside the
-crate, through the real binary and the real filesystem — and Day 7 is release
-qualification: per-user installers, checksummed artefacts for five targets, a
-thousand simulated scheduler cycles, and clean-account install and uninstall on
-all three platforms.
+## Release status
 
 **0.1.1 is released.** Checksummed artefacts for all five targets are attached
 to the GitHub release, and the npm channel carries the same binaries with a
 provenance attestation tying each package to the workflow run and commit that
 built it.
+
+Every safety gate is exercised by CI on Ubuntu, macOS, and Windows, and the
+safety model is additionally attacked from outside the crate, through the real
+binary and the real filesystem. Scheduling was verified on real machines rather
+than in CI alone: the schedule was enabled, triggered, observed firing the
+binary, and disabled on Linux, macOS, and Windows. Release qualification covers
+the per-user installers, a thousand simulated scheduler cycles, and
+clean-account install and uninstall on all three platforms.
 
 Two things remain honestly short of proof and are recorded rather than glossed:
 no test yet downloads a published artefact and checks it against the published
