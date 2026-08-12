@@ -32,33 +32,6 @@ The first release does **not** support generic cache cleaning, arbitrary path de
 
 Unknown ownership, uncertain activity, unverified recoverability, shared data, active work, protected paths, and ambiguous platform state always result in a skip.
 
-## Governing documents
-
-Read these before implementing:
-
-1. [`VISION.md`](VISION.md) — product purpose and boundaries.
-2. [`PLANS.md`](PLANS.md) — the approved seven-day execution plan.
-3. [`SAFETY.md`](SAFETY.md) — non-negotiable safety contract.
-4. [`ACCEPTANCE.md`](ACCEPTANCE.md) — mandatory release gates.
-5. [`AGENTS.md`](AGENTS.md) — instructions for autonomous coding agents.
-6. [`RESEARCH.md`](RESEARCH.md) — prior art, feasibility findings, and deferred architecture.
-7. [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) — current repository state and next action.
-8. [`BOOTSTRAP_PROMPT.md`](BOOTSTRAP_PROMPT.md) — the exact starting prompt for an implementation agent.
-
-When documents appear to conflict, use this precedence:
-
-```text
-SAFETY.md
-ACCEPTANCE.md
-PLANS.md
-AGENTS.md
-VISION.md
-RESEARCH.md
-README.md
-```
-
-No document may weaken `SAFETY.md` or `ACCEPTANCE.md`.
-
 ## Installing
 
 Everything below happens inside your own account. Nothing asks for
@@ -481,14 +454,31 @@ qualification: per-user installers, checksummed artefacts for five targets, a
 thousand simulated scheduler cycles, and clean-account install and uninstall on
 all three platforms.
 
-**0.1.0 is not released.** Every gate is met and every artefact is built, but
-tagging is the owner's decision and has not been taken. Two things remain
-honestly short of proof and are recorded rather than glossed: no test has yet
-downloaded a published artefact and checked it against a published
-`SHA256SUMS`, which only becomes possible once a release exists; and a
-scheduled run cannot reach an actual workspace clean in CI, because the
-24-hour observation window is a real safety gate and a CI fixture is seconds
-old.
+**0.1.1 is released.** Checksummed artefacts for all five targets are attached
+to the GitHub release, and the npm channel carries the same binaries with a
+provenance attestation tying each package to the workflow run and commit that
+built it.
 
-See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact
-handover state and the CI run identifiers behind each gate.
+Two things remain honestly short of proof and are recorded rather than glossed:
+no test yet downloads a published artefact and checks it against the published
+`SHA256SUMS`, which the installers do but CI does not; and a scheduled run
+cannot reach an actual workspace clean in CI, because the 24-hour observation
+window is a real safety gate and a CI fixture is seconds old.
+
+## Project documents
+
+The design record, kept in [`docs/`](docs):
+
+- [`SAFETY.md`](SAFETY.md) — the non-negotiable safety contract.
+- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) — the release gates.
+- [`docs/VISION.md`](docs/VISION.md) — product purpose and boundaries.
+- [`docs/PLANS.md`](docs/PLANS.md) — the seven-day execution plan.
+- [`docs/RESEARCH.md`](docs/RESEARCH.md) — prior art and deferred architecture.
+- [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) — the CI run
+  identifiers behind each gate.
+- [`docs/AGENTS.md`](docs/AGENTS.md) and
+  [`docs/BOOTSTRAP_PROMPT.md`](docs/BOOTSTRAP_PROMPT.md) — how the project is
+  built by coding agents.
+
+Where they conflict, `SAFETY.md` and `docs/ACCEPTANCE.md` win, and no document
+may weaken either.
