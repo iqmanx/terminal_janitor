@@ -306,7 +306,14 @@ jobs:
               echo "$name@$version is already published; leaving it untouched"
               return 0
             fi
-            npm publish "npm/$package" --provenance --access public
+            # The `./` is load-bearing. npm resolves a bare `a/b` argument as
+            # the GitHub shorthand for a repository before it considers a
+            # directory of that name, so `npm/terminal_janitor-linux-x64`
+            # sends it to github.com/npm/terminal_janitor-linux-x64 — a
+            # repository nobody owns — and the publish dies on an SSH key
+            # rather than on anything about this package. Only a path that
+            # begins with `./`, `../`, `/` or `~/` is read as a directory.
+            npm publish "./npm/$package" --provenance --access public
           }
 
           for package in terminal_janitor-linux-x64 terminal_janitor-linux-arm64 \

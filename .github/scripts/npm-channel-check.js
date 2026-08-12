@@ -135,6 +135,32 @@ for (const name of directories) {
 }
 ok(`every package is version ${version} and selects itself by os and cpu`);
 
+// --- the workflow publishes directories, not repositories -------------------
+
+// npm resolves a bare `a/b` argument as the GitHub shorthand for a repository
+// before it considers a directory of that name, so `npm publish npm/<package>`
+// reaches for github.com/npm/<package> and fails on an SSH key. Only a path
+// beginning with `./`, `../`, `/` or `~/` is read as a directory. The mistake
+// costs nothing to make, survives every other check in this file, and cannot
+// surface before a tag, because publishing is the one step no earlier job runs.
+const publishArguments = [
+  ...workflowSource.matchAll(/npm publish\s+"?([^"\s]+)"?/g),
+].map((match) => match[1]);
+
+if (publishArguments.length === 0) {
+  fail('the release workflow contains no npm publish command');
+} else {
+  const bare = publishArguments.filter((arg) => !/^([.]{1,2}|~)?\//.test(arg));
+  if (bare.length > 0) {
+    fail(
+      `the release workflow publishes ${bare.join(', ')}, which npm reads as ` +
+        'a GitHub repository rather than a directory; prefix the path with ./',
+    );
+  } else {
+    ok(`all ${publishArguments.length} npm publish paths are directories`);
+  }
+}
+
 // --- the wrapper's own manifest -------------------------------------------
 
 if (wrapperManifest.bin?.terminal_janitor !== 'bin/terminal_janitor.js') {
