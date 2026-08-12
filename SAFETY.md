@@ -237,10 +237,10 @@ Runs:     200 detailed records maximum
 
 The product must govern its own storage.
 
-## 13. Agent and deadline rule
+## 13. Scope and deadline rule
 
-An implementation agent must remove optional scope before weakening this safety contract.
+Optional scope must be removed before this safety contract is weakened.
 
-A seven-day deadline is not authority to bypass a gate.
+A deadline is not authority to bypass a gate.
 
 If a mandatory safety condition cannot be implemented and tested, the release must stop.
