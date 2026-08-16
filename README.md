@@ -135,7 +135,7 @@ terminal_janitor disable     # stops it again
 ## Commands
 
 ```text
-terminal_janitor init --root <path> [--root <path> ...] [--pnpm <path>]
+terminal_janitor init --root <path>
 terminal_janitor scan
 terminal_janitor scan --json
 terminal_janitor scan --dry-run
@@ -154,9 +154,27 @@ terminal_janitor disable
 `--json` and `--dry-run` are global. `--dry-run` reads and reports without
 writing state, so a rehearsal never advances the ledger's observation history.
 
+`init` takes four options of its own:
+
+```text
+--root <path>          Approved project root. At least one is required.
+                       Each flag takes exactly one path; repeat the flag
+                       to approve more than one root.
+--minimum-free <size>  Cleanup trigger threshold. Defaults to 10 GiB.
+--target-free <size>   Recovery target threshold. Defaults to 15 GiB.
+--pnpm <path>          pnpm executable to enrol. PATH is searched once
+                       when this is omitted.
+```
+
+So two roots and an explicit pnpm are written out in full:
+
+```sh
+terminal_janitor init --root ~/work --root ~/experiments --pnpm /usr/local/bin/pnpm
+```
+
 `init` requires at least one explicit `--root`; it never guesses the home
-directory or a conventional projects directory. Optional `--minimum-free` and
-`--target-free` values use the strict size syntax below. Inputs must exist and
+directory or a conventional projects directory. `--minimum-free` and
+`--target-free` use the strict size syntax below. Inputs must exist and
 be directories. Each root is canonicalised, bound to its native volume and
 file identity, and written to configuration and state as one coordinated
 transaction. Filesystem roots/whole system drives and root paths whose final
